@@ -1,8 +1,11 @@
 """
 Process A — Feed Handler
 ========================
-Connects to Binance Spot Testnet WebSocket (btcusdt@bookTicker).
-Calculates the mid price from best bid/ask and publishes to Redis.
+Connects to Binance WebSocket (btcusdt@bookTicker) and publishes mid-prices.
+
+Data source  : Real Binance production WebSocket by default (FEED_TESTNET=false)
+               Switch to testnet stream by setting FEED_TESTNET=true in .env
+Order routing: Execution Manager (Process C) — always targets Binance Testnet REST
 
 Redis output channel : market_data
 Payload schema       : {"symbol": "BTCUSDT", "mid_price": float,
@@ -26,8 +29,13 @@ REDIS_PORT  = int(os.getenv("REDIS_PORT", 6379))
 SYMBOL      = os.getenv("TRADE_SYMBOL", "BTCUSDT").lower()   # ws stream is lowercase
 CHANNEL     = "market_data"
 
-# Binance Spot Testnet WebSocket endpoint
-WS_URL = f"wss://stream.testnet.binance.vision/ws/{SYMBOL}@bookTicker"
+# Binance WebSocket endpoint
+# FEED_TESTNET=false (default) → real production stream, real prices, no auth needed
+# FEED_TESTNET=true            → testnet stream, simulated prices
+# NOTE: this is independent of order execution — orders always go to Binance Testnet REST.
+FEED_TESTNET = os.getenv("FEED_TESTNET", "false").lower() == "true"
+WS_HOST = "stream.testnet.binance.vision" if FEED_TESTNET else "stream.binance.com:9443"
+WS_URL  = f"wss://{WS_HOST}/ws/{SYMBOL}@bookTicker"
 
 # ── Redis client ──────────────────────────────────────────────────────────────
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)

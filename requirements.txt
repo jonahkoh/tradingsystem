@@ -1,0 +1,18 @@
+# Binance API
+python-binance==1.0.19
+
+# WebSocket streaming
+websockets==12.0
+
+# Redis client
+redis==5.0.1
+
+# Environment variables
+python-dotenv==1.0.0
+
+# FastAPI (Process E - API Gateway & Kill Switch)
+fastapi==0.109.0
+uvicorn==0.27.0
+
+# HTTP client (for Execution Manager)
+httpx==0.26.0

@@ -21,6 +21,7 @@ Redis channels
 
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -40,7 +41,8 @@ REDIS_PORT    = int(os.getenv("REDIS_PORT", 6379))
 API_KEY       = os.getenv("BINANCE_API_KEY", "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 SYMBOL        = os.getenv("TRADE_SYMBOL", "BTCUSDT")
-TRADE_QTY     = float(os.getenv("TRADE_QUANTITY", "0.001"))     #fixed quantity for all orders; in production, might want to calculate this dynamically based on risk management rules
+TRADE_QTY     = float(os.getenv("TRADE_QUANTITY", "0.001"))  # fallback / minimum qty
+RISK_PCT      = float(os.getenv("RISK_PCT", "0.01"))         # fraction of free quote balance to risk per trade (1 %)
 
 SIGNALS_CHANNEL = "trade_signals"
 CONTROL_CHANNEL = "control"
@@ -65,6 +67,55 @@ _halted = threading.Event()
 # Business logic — no Redis or I/O side-effects at this layer.
 # These pure/injectable functions are fully unit-testable.
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _get_dynamic_qty(client: Client, symbol: str) -> float:
+    """
+    Calculate order quantity as RISK_PCT of the free quote-asset balance.
+
+    Steps:
+      1. Fetch the current mid price via /api/v3/ticker/price.
+      2. Fetch free USDT balance from /api/v3/account.
+      3. qty = floor((free_usdt * RISK_PCT) / price, 5 decimal places).
+      4. Enforce a floor of TRADE_QTY so we never send a sub-minimum order.
+
+    Falls back silently to TRADE_QTY on any error so a transient Binance
+    hiccup never blocks order execution.
+    """
+    try:
+        ticker        = client.get_symbol_ticker(symbol=symbol)
+        current_price = float(ticker["price"])
+        if current_price <= 0:
+            raise ValueError(f"Non-positive price returned: {current_price}")
+
+        account       = client.get_account()
+        quote_asset   = symbol[len(symbol.rstrip("USDT")):] if symbol.endswith("USDT") else "USDT"
+        free_balance  = next(
+            (float(b["free"]) for b in account["balances"] if b["asset"] == quote_asset),
+            0.0,
+        )
+
+        # Truncate (not round) to 5 d.p. — Binance rejects qty with too many decimals
+        raw_qty = (free_balance * RISK_PCT) / current_price
+        qty     = math.floor(raw_qty * 1e5) / 1e5
+
+        if qty < TRADE_QTY:
+            log.warning(
+                "Dynamic qty %.5f BTC is below minimum %.5f. Using minimum.",
+                qty, TRADE_QTY,
+            )
+            return TRADE_QTY
+
+        log.info(
+            "Dynamic sizing: %.2f %s × %.0f%% ÷ %.2f = %.5f %s",
+            free_balance, quote_asset, RISK_PCT * 100, current_price,
+            qty, symbol[:3],
+        )
+        return qty
+
+    except Exception as exc:
+        log.warning("Dynamic sizing failed (%s). Falling back to TRADE_QTY=%.5f.", exc, TRADE_QTY)
+        return TRADE_QTY
+
 
 def format_order_payload(signal: dict, quantity: float = TRADE_QTY) -> dict:
     """
@@ -163,7 +214,8 @@ def handle_signal(
 
     try:
         signal = json.loads(raw_data)
-        order_params = format_order_payload(signal)
+        qty = _get_dynamic_qty(client, signal.get("symbol", SYMBOL))
+        order_params = format_order_payload(signal, quantity=qty)
     except (json.JSONDecodeError, ValueError) as exc:
         log.warning("Bad signal message (%s): %r", exc, raw_data)
         return None

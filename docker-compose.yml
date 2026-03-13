@@ -1,6 +1,8 @@
 version: '3.8'
 
 services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: tradingsystem_redis
@@ -15,6 +17,76 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # ── Process A — Feed Handler ──────────────────────────────────────────────────
+  feed-handler:
+    build: .
+    container_name: tradingsystem_feed_handler
+    command: python feed-handler.py
+    env_file: .env
+    environment:
+      REDIS_HOST: redis       # override localhost → docker service name
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process B — Strategy Engine ───────────────────────────────────────────────
+  strategy-engine:
+    build: .
+    container_name: tradingsystem_strategy_engine
+    command: python strategy-engine.py
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process C — Execution Manager ─────────────────────────────────────────────
+  execution-manager:
+    build: .
+    container_name: tradingsystem_execution_manager
+    command: python execution.py
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process D — Ledger & Risk Monitor ─────────────────────────────────────────
+  ledger:
+    build: .
+    container_name: tradingsystem_ledger
+    command: python ledger.py
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      LOG_FILE: /data/trades.log    # write log to the mounted volume
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/data               # trades.log persists on the host under ./data/
+    restart: unless-stopped
+
+  # ── Process E — API Gateway & Kill Switch ─────────────────────────────────────
+  api-gateway:
+    build: .
+    container_name: tradingsystem_api_gateway
+    command: uvicorn api_gateway:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
 
 volumes:
   redis_data:

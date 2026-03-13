@@ -34,7 +34,7 @@ BASE_ASSET     = SYMBOL[:3]          # e.g. "BTC"
 
 ORDER_CHANNEL  = "order_results"
 MARKET_CHANNEL = "market_data"
-LOG_FILE       = "trades.log"
+LOG_FILE       = os.getenv("LOG_FILE", "trades.log")
 RETRY_DELAY    = 5                   # seconds between Redis reconnect attempts
 
 # ── Logging ────────────────────────────────────────────────────────────────────

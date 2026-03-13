@@ -33,9 +33,13 @@ CHANNEL     = "market_data"
 # FEED_TESTNET=false (default) → real production stream, real prices, no auth needed
 # FEED_TESTNET=true            → testnet stream, simulated prices
 # NOTE: this is independent of order execution — orders always go to Binance Testnet REST.
-FEED_TESTNET = os.getenv("FEED_TESTNET", "false").lower() == "true"
-WS_HOST = "stream.testnet.binance.vision" if FEED_TESTNET else "stream.binance.com:9443"
-WS_URL  = f"wss://{WS_HOST}/ws/{SYMBOL}@bookTicker"
+FEED_TESTNET     = os.getenv("FEED_TESTNET", "false").lower() == "true"
+WS_HOST          = "stream.testnet.binance.vision" if FEED_TESTNET else "stream.binance.com:9443"
+WS_URL           = f"wss://{WS_HOST}/ws/{SYMBOL}@bookTicker"
+
+# Throttle: publish at most once every PUBLISH_INTERVAL seconds.
+# bookTicker fires 20-30x/s on production; 1 s is plenty for MA-based strategies.
+PUBLISH_INTERVAL = float(os.getenv("PUBLISH_INTERVAL", "1.0"))
 
 # ── Redis client ──────────────────────────────────────────────────────────────
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -48,7 +52,12 @@ async def stream_book_ticker() -> None:
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
                 print("[Feed Handler] Connected. Publishing to Redis …")
+                _last_publish = 0.0
                 async for raw in ws:
+                    now = time.time()
+                    if now - _last_publish < PUBLISH_INTERVAL:
+                        continue                        # drop ticks within the throttle window
+
                     data      = json.loads(raw)
                     best_bid  = float(data["b"])        # best bid price
                     best_ask  = float(data["a"])        # best ask price
@@ -57,11 +66,12 @@ async def stream_book_ticker() -> None:
                     payload = json.dumps({
                         "symbol":    SYMBOL.upper(),
                         "mid_price": mid_price,
-                        "timestamp": int(time.time()),
+                        "timestamp": int(now),
                     })
 
                     r.publish(CHANNEL, payload)
                     print(f"[Feed Handler] {payload}")
+                    _last_publish = now
 
         except websockets.ConnectionClosed as exc:
             print(f"[Feed Handler] Connection closed ({exc}). Reconnecting in 3 s …")

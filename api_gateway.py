@@ -33,6 +33,8 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
+import db
+
 load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -153,6 +155,40 @@ def kill_switch(r: redis.Redis = Depends(get_redis)) -> JSONResponse:
         "subscribers": subscribers,
         "result":      "HALT published successfully",
     })
+
+
+@app.get("/pnl", tags=["trading"])
+def get_pnl() -> JSONResponse:
+    """
+    Returns the current PnL summary derived from persisted fills.
+    Reflects state as of the last successful order fill.
+    """
+    try:
+        summary = db.get_pnl_summary()
+    except Exception as exc:
+        log.error("Failed to read PnL from DB: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DB unavailable: {exc}",
+        )
+    return JSONResponse(summary)
+
+
+@app.get("/trades", tags=["trading"])
+def get_trades(limit: int = 100) -> JSONResponse:
+    """
+    Returns the most recent fills, newest first.
+    Optional query param: ?limit=N (default 100).
+    """
+    try:
+        trades = db.get_trades(limit=limit)
+    except Exception as exc:
+        log.error("Failed to read trades from DB: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DB unavailable: {exc}",
+        )
+    return JSONResponse(trades)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

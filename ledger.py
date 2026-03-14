@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 import redis
 from dotenv import load_dotenv
 
+import db
+
 load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ def _apply_fill(side: str, price: float, qty: float) -> None:
 
 # ── Output helpers ─────────────────────────────────────────────────────────────
 def _write_log(side: str, price: float, qty: float, timestamp: int) -> None:
-    """Append one fill line to trades.log (matches the specified format)."""
+    """Append one fill line to trades.log and persist to SQLite."""
     dt   = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     upnl = _unrealized_pnl()
 
@@ -105,6 +107,17 @@ def _write_log(side: str, price: float, qty: float, timestamp: int) -> None:
 
     # Echo to console via the logger so it gets the timestamp prefix
     log.info(line)
+
+    # Persist to SQLite so state survives restarts
+    db.insert_fill(
+        timestamp=timestamp,
+        side=side,
+        price=price,
+        qty=qty,
+        position=current_qty,
+        avg_entry=avg_entry_price,
+        realized_pnl=session_realized_pnl,
+    )
 
 
 def _print_position_summary() -> None:
@@ -150,8 +163,27 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
+def _restore_state() -> None:
+    """Reload position state from the last DB row on startup."""
+    global current_qty, avg_entry_price, session_realized_pnl
+    last = db.load_last_state()
+    if last:
+        current_qty          = last["position"]
+        avg_entry_price      = last["avg_entry"]
+        session_realized_pnl = last["realized_pnl"]
+        log.info(
+            "Restored state from DB — pos=%.6f avg_entry=%.2f realized_pnl=%.4f",
+            current_qty, avg_entry_price, session_realized_pnl,
+        )
+    else:
+        log.info("No prior fills found in DB. Starting fresh.")
+
+
 def run() -> None:
     global last_market_price
+
+    db.init_db()
+    _restore_state()
 
     log.info(
         "Ledger starting. Subscribing to '%s' and '%s'.",

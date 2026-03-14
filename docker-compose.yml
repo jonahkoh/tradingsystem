@@ -65,12 +65,13 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
-      LOG_FILE: /data/trades.log    # write log to the mounted volume
+      LOG_FILE: /data/trades.log
+      DB_FILE: /data/trades.db
     depends_on:
       redis:
         condition: service_healthy
     volumes:
-      - ./data:/data               # trades.log persists on the host under ./data/
+      - ./data:/data
     restart: unless-stopped
 
   # ── Process E — API Gateway & Kill Switch ─────────────────────────────────────
@@ -81,11 +82,14 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      DB_FILE: /data/trades.db
     depends_on:
       redis:
         condition: service_healthy
     ports:
       - "8000:8000"
+    volumes:
+      - ./data:/data
     restart: unless-stopped
 
 volumes:

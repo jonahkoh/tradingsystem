@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
 
   # ── Infrastructure ────────────────────────────────────────────────────────────
@@ -20,9 +18,10 @@ services:
 
   # ── Process A — Feed Handler ──────────────────────────────────────────────────
   feed-handler:
-    build: .
+    build:
+      context: .
+      dockerfile: services/feed-handler/Dockerfile
     container_name: tradingsystem_feed_handler
-    command: python feed-handler.py
     env_file: .env
     environment:
       REDIS_HOST: redis       # override localhost → docker service name
@@ -33,9 +32,10 @@ services:
 
   # ── Process B — Strategy Engine ───────────────────────────────────────────────
   strategy-engine:
-    build: .
+    build:
+      context: .
+      dockerfile: services/strategy-engine/Dockerfile
     container_name: tradingsystem_strategy_engine
-    command: python strategy-engine.py
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -46,9 +46,10 @@ services:
 
   # ── Process C — Execution Manager ─────────────────────────────────────────────
   execution-manager:
-    build: .
+    build:
+      context: .
+      dockerfile: services/execution-manager/Dockerfile
     container_name: tradingsystem_execution_manager
-    command: python execution.py
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -59,9 +60,10 @@ services:
 
   # ── Process D — Ledger & Risk Monitor ─────────────────────────────────────────
   ledger:
-    build: .
+    build:
+      context: .
+      dockerfile: services/ledger/Dockerfile
     container_name: tradingsystem_ledger
-    command: python ledger.py
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -76,9 +78,10 @@ services:
 
   # ── Process E — API Gateway & Kill Switch ─────────────────────────────────────
   api-gateway:
-    build: .
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
     container_name: tradingsystem_api_gateway
-    command: uvicorn api_gateway:app --host 0.0.0.0 --port 8000
     env_file: .env
     environment:
       REDIS_HOST: redis

@@ -30,7 +30,9 @@ REDIS_PORT       = int(os.getenv("REDIS_PORT", 6379))
 BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 SYMBOL           = os.getenv("TRADE_SYMBOL", "BTCUSDT").lower()
-WS_URL           = f"wss://stream.testnet.binance.vision/ws/{SYMBOL}@bookTicker"
+FEED_TESTNET     = os.getenv("FEED_TESTNET", "false").lower() == "true"
+WS_HOST          = "stream.testnet.binance.vision" if FEED_TESTNET else "stream.binance.com:9443"
+WS_URL           = f"wss://{WS_HOST}/ws/{SYMBOL}@bookTicker"
 
 PASS = "\033[92m[PASS]\033[0m"
 FAIL = "\033[91m[FAIL]\033[0m"
@@ -130,7 +132,8 @@ async def _ws_first_tick() -> dict:
 
 
 def test_binance_websocket() -> None:
-    print(f"\n[5] Binance Testnet — WebSocket ({SYMBOL}@bookTicker)")
+    mode = "Testnet" if FEED_TESTNET else "Production"
+    print(f"\n[5] Binance {mode} — WebSocket ({SYMBOL}@bookTicker)")
     try:
         loop = asyncio.new_event_loop()
         data = loop.run_until_complete(_ws_first_tick())

@@ -74,17 +74,17 @@ Lightweight crypto trading pipeline using Binance Spot Testnet, Redis Pub/Sub, a
 | `market_data`    | Feed Handler       | Strategy Engine, Ledger | `{symbol, mid_price, timestamp}` |
 | `trade_signals`  | Strategy Engine    | Execution Manager      | `{action, symbol, type}`         |
 | `order_results`  | Execution Manager  | Ledger                 | `{order_id, side, price, qty, result}` |
-| `control`        | API Gateway        | Execution Manager      | `{command: "HALT"}`              |
+| `control`        | API Gateway        | Execution Manager      | `{command: "HALT"|"START"}`      |
 
 ### Services
 
-| File                 | Process | Role                                              |
-|----------------------|---------|---------------------------------------------------|
-| `feed-handler.py`    | A       | Streams live BTC prices from Binance WebSocket    |
-| `strategy-engine.py` | B       | MA crossover signals (7 vs 25 window)             |
-| `execution.py`       | C       | Places orders on Binance Testnet, enforces kill switch |
-| `ledger.py`          | D       | Tracks position, PnL, persists fills to SQLite    |
-| `api_gateway.py`     | E       | HTTP control plane — kill switch + PnL endpoints  |
+| File                                      | Process | Role                                              |
+|-------------------------------------------|---------|---------------------------------------------------|
+| `services/feed-handler/feed-handler.py`   | A       | Streams live BTC prices from Binance WebSocket    |
+| `services/strategy-engine/strategy-engine.py` | B   | MA crossover signals (7 vs 25 window)             |
+| `services/execution-manager/execution.py` | C       | Places orders on Binance Testnet, HALT/START control |
+| `services/ledger/ledger.py`               | D       | Tracks position, PnL, persists fills to SQLite    |
+| `services/api-gateway/api_gateway.py`     | E       | HTTP control plane — kill switch + PnL endpoints  |
 
 ### External dependencies
 
@@ -132,6 +132,7 @@ All 5 checks should print `[PASS]`.
 | GET    | `/pnl`     | Current PnL summary from SQLite          |
 | GET    | `/trades`  | Recent fills (`?limit=N`, default 100)   |
 | POST   | `/kill`    | Emergency halt — cancels all open orders |
+| POST   | `/start-again` | Resume execution after HALT          |
 
 Interactive docs available at `http://localhost:8000/docs`.
 

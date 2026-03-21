@@ -5,9 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY services/ledger/ledger.py ./ledger.py
-COPY services/ledger/db.py ./db.py
+COPY services/ledger/ledger_service.py ./ledger_service.py
 
 RUN mkdir -p /data
 
-CMD ["python", "ledger.py"]
+CMD ["python", "ledger_service.py"]

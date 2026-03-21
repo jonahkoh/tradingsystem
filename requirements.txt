@@ -16,3 +16,7 @@ uvicorn==0.27.0
 
 # HTTP client (for Execution Manager)
 httpx==0.26.0
+
+# Process F - Sentiment Oracle
+feedparser==6.0.11
+nltk==3.9.1

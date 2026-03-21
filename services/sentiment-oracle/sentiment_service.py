@@ -56,19 +56,63 @@ def ensure_vader_lexicon() -> None:
 
 def create_analyzer() -> SentimentIntensityAnalyzer:
     ensure_vader_lexicon()
-    return SentimentIntensityAnalyzer()
-
+    analyzer = SentimentIntensityAnalyzer()
+    #custom crypto lexicon
+    crypto_lexicon = {
+        # --- Extreme Bullish (+3.0 to +4.0) ---
+        "bullish": 3.0,
+        "moon": 3.5,
+        "mooning": 3.5,
+        "ath": 3.0,
+        "all-time high": 3.0,
+        
+        # --- Positive Momentum (+1.5 to +2.9) ---
+        "pump": 2.0,
+        "surge": 2.0,
+        "rally": 2.0,
+        "breakout": 2.0,
+        "adoption": 2.5,
+        "upgrade": 2.0,
+        "partnership": 2.5,
+        
+        # --- Negative Momentum (-1.5 to -2.9) ---
+        "dump": -2.5,
+        "bearish": -2.5,
+        "fud": -2.5,
+        "plunge": -2.5,
+        "lawsuit": -2.5,
+        "sec": -1.5,  # Contextual, but heavily leans negative in crypto news
+        
+        # --- Extreme Fear / Catastrophe (-3.0 to -4.0) ---
+        "rekt": -4.0,
+        "rug": -4.0,
+        "rugpull": -4.0,
+        "scam": -4.0,
+        "hack": -3.5,
+        "hacked": -3.5,
+        "exploit": -3.5,
+        "bankrupt": -4.0,
+        "insolvency": -4.0,
+        "subpoena": -3.0,
+        "delist": -3.0,
+        "delisted": -3.0,
+        "crash": -3.5
+    }
+    
+    # Inject the custom crypto dictionary directly into VADER's brain
+    analyzer.lexicon.update(crypto_lexicon)
+    
+    log.info(f"Loaded VADER with {len(crypto_lexicon)} custom crypto terms.")
+    return analyzer
 
 def classify_status(compound_score: float) -> str:
-    if compound_score <= -0.50:
+    if compound_score < -0.30:
         return "SEVERE_FEAR"
-    if compound_score <= -0.15:
-        return "FEAR"
-    if compound_score < 0.15:
+    if compound_score < -0.05:
+        return "UNEASE"
+    if compound_score <= 0.25:
         return "NEUTRAL"
-    if compound_score < 0.50:
-        return "GREED"
-    return "EUPHORIA"
+    return "HYPE"
 
 
 def fetch_recent_headlines(
@@ -154,16 +198,14 @@ def run_once(
 def run() -> None:
     analyzer = create_analyzer()
 
+    redis_client = redis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, decode_responses=True, socket_connect_timeout=5
+    )
+    
     log.info("Starting Sentiment Oracle. Redis=%s:%s channel=%s", REDIS_HOST, REDIS_PORT, SENTIMENT_CHANNEL)
 
     while True:
         try:
-            redis_client = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                decode_responses=True,
-                socket_connect_timeout=5,
-            )
             redis_client.ping()
             run_once(redis_client=redis_client, analyzer=analyzer)
 

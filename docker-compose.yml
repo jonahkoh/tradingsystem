@@ -96,6 +96,20 @@ services:
       - ./data:/data
     restart: unless-stopped
 
+  # ── Process F — Sentiment Oracle ───────────────────────────────────────────────
+  sentiment-oracle:
+    build:
+      context: .
+      dockerfile: services/sentiment-oracle/Dockerfile
+    container_name: tradingsystem_sentiment_oracle
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:
 

@@ -266,8 +266,8 @@ def handle_control(
         _halted.set()
 
         try:
-            _cancel_all_open_orders(client, SYMBOL)
-            log.info("All open orders for %s cancelled (or none were open).", SYMBOL)
+            client.cancel_open_orders(symbol=SYMBOL)
+            log.info("All open orders for %s cancelled.", SYMBOL)
         except (BinanceAPIException, BinanceRequestException, Exception) as exc:
             # Log but do NOT abort the shutdown — halting is safety-critical.
             log.error("Could not cancel open orders: %s", exc)
@@ -286,21 +286,6 @@ def handle_control(
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
-
-def _cancel_all_open_orders(client: Client, symbol: str) -> None:
-    """
-    Cancel all open orders for a symbol with compatibility fallback.
-
-    Some python-binance versions expose `cancel_open_orders`, while older
-    versions only expose `get_open_orders` + `cancel_order`.
-    """
-    if hasattr(client, "cancel_open_orders"):
-        client.cancel_open_orders(symbol=symbol)
-        return
-
-    open_orders = client.get_open_orders(symbol=symbol)
-    for order in open_orders:
-        client.cancel_order(symbol=symbol, orderId=order["orderId"])
 
 def _parse_avg_price(resp: dict) -> float:
     """

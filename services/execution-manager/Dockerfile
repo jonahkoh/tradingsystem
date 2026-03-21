@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY services/execution-manager/execution.py ./execution.py
+COPY services/execution-manager/execution_service.py ./execution_service.py
 
-CMD ["python", "execution.py"]
+CMD ["python", "execution_service.py"]

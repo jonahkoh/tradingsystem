@@ -1,49 +1,58 @@
-"""
-Process E — API Gateway & Kill Switch
-=======================================
-A lightweight FastAPI HTTP server that acts as the human control plane
-for the trading pipeline.
+"""Process E - API Gateway (FastAPI control plane and reporting)."""
 
-Endpoints
-  GET  /health   — liveness probe (no Redis required)
-  GET  /status   — reports whether the kill switch has been fired this session
-  POST /kill     — publishes {"command": "HALT"} to the Redis `control` channel,
-                   which Process C (Execution Manager) receives and acts on instantly
-    POST /start-again — publishes {"command": "START"} to Redis `control`
-                                            so Process C resumes after a HALT
+from __future__ import annotations
 
-How the kill switch works end-to-end
-  1. Operator hits POST /kill (curl, browser, Postman, etc.)
-  2. This server publishes {"command": "HALT"} to the Redis `control` channel.
-  3. Process C is already subscribed to `control`. Redis delivers the message
-     in <1 ms (it's on the same local network / same machine).
-  4. Process C's handle_control() fires: sets _halted and cancels open orders.
-  5. No further orders can be placed until POST /start-again publishes START.
-
-Redis is injected via FastAPI's Depends() mechanism so tests can substitute
-a mock without monkey-patching globals.
-"""
-
+import csv
+import hashlib
+import hmac
+import inspect
+import json
 import logging
 import os
 import time
+from collections import deque
+from contextlib import suppress
+from pathlib import Path
+from typing import Any
 
-import redis
-import redis.exceptions
+import httpx
+import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import JSONResponse
-
-import db
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-REDIS_HOST      = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT      = int(os.getenv("REDIS_PORT", 6379))
-CONTROL_CHANNEL = "control"
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# Configuration
+API_KEY = os.getenv("API_KEY", "").strip()
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+CONTROL_CHANNEL = "control"
+MARKET_DATA_CHANNEL = "market_data"
+TRADE_SIGNALS_CHANNEL = "trade_signals"
+SENTIMENT_SIGNALS_CHANNEL = "sentiment_signals"
+
+BALANCE_URL = "https://mock-api.roostoo.com/v3/balance"
+CSV_FILE = Path(os.getenv("LOG_FILE", "logs/execution_log.csv"))
+TRADES_LIMIT = 50
+
+EXPECTED_TRADE_HEADERS = [
+    "Timestamp",
+    "Action",
+    "Pair",
+    "Price",
+    "Quantity",
+    "Strategy_Signal",
+    "API_Status",
+    "Latency_ms",
+    "Raw_Error",
+]
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [API Gateway] %(message)s",
@@ -51,180 +60,208 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── App state ──────────────────────────────────────────────────────────────────
-# Tracks whether /kill has been called this session.
-# Simple bool is fine here — the gateway is single-process, single-threaded
-# (uvicorn handles concurrency at the ASGI level, not via threads).
-_kill_fired: bool = False
-_kill_timestamp: float | None = None
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Trading System — API Gateway",
-    description="Control plane for the crypto trading pipeline.",
-    version="1.0.0",
+app = FastAPI(title="Trading System API Gateway", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-# ── Redis dependency ───────────────────────────────────────────────────────────
-def get_redis() -> redis.Redis:
-    """
-    FastAPI dependency that yields a Redis client.
-
-    WHY Depends(): tests can override this with app.dependency_overrides so
-    every endpoint gets a mock Redis — no real connection needed in tests.
-    """
-    return redis.Redis(
+@app.on_event("startup")
+async def on_startup() -> None:
+    app.state.redis = aioredis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
         decode_responses=True,
-        socket_connect_timeout=3,
+        socket_connect_timeout=5,
     )
+    log.info("API Gateway online. Redis target %s:%s", REDIS_HOST, REDIS_PORT)
 
 
-# ── Core publish helper ────────────────────────────────────────────────────────
-def publish_control(r: redis.Redis, command: str) -> int:
-    """
-    Publish a control command (HALT / START) to the control channel.
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    redis_client: aioredis.Redis | None = getattr(app.state, "redis", None)
+    if redis_client is not None:
+        close_method = getattr(redis_client, "aclose", None)
+        if callable(close_method):
+            maybe_awaitable = close_method()
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        log.info("Redis client closed.")
 
-    Returns the number of subscribers that received the message (from Redis).
-    Raises redis.exceptions.RedisError on connectivity issues.
-    """
-    import json
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _build_balance_signature(secret_key: str, timestamp_ms: int) -> str:
+    message = f"timestamp={timestamp_ms}"
+    digest = hmac.new(secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256)
+    return digest.hexdigest()
+
+
+async def _publish_control(command: str) -> None:
+    redis_client: aioredis.Redis = app.state.redis
     payload = json.dumps({"command": command})
-    subscribers = r.publish(CONTROL_CHANNEL, payload)
-    log.warning("%s published to '%s'. Subscribers notified: %d", command, CONTROL_CHANNEL, subscribers)
-    return subscribers
+    await redis_client.publish(CONTROL_CHANNEL, payload)
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
-
-@app.get("/health", tags=["ops"])
-def health() -> JSONResponse:
-    """
-    Liveness probe — always returns 200 if the process is running.
-    Does NOT check Redis so container orchestrators get a fast response.
-    """
-    return JSONResponse({"status": "ok", "service": "api-gateway"})
-
-
-@app.get("/status", tags=["ops"])
-def status_endpoint() -> JSONResponse:
-    """
-    Reports whether the kill switch has been activated this session.
-    Useful for dashboards and monitoring.
-    """
-    return JSONResponse({
-        "kill_switch_fired": _kill_fired,
-        "kill_timestamp":    _kill_timestamp,
-    })
+def _normalize_trade_row(row: dict[str, str]) -> dict[str, str]:
+    normalized = {header: row.get(header, "") for header in EXPECTED_TRADE_HEADERS}
+    # Backward compatibility with the current ledger header naming.
+    if not normalized["Latency_ms"] and row.get("latency_ms"):
+        normalized["Latency_ms"] = row["latency_ms"]
+    if not normalized["Raw_Error"] and row.get("raw_error"):
+        normalized["Raw_Error"] = row["raw_error"]
+    return normalized
 
 
-@app.post("/kill", tags=["control"], status_code=status.HTTP_200_OK)
-def kill_switch(r: redis.Redis = Depends(get_redis)) -> JSONResponse:
-    """
-    Trigger the emergency kill switch.
-
-    Publishes {"command": "HALT"} to the Redis `control` channel.
-    Process C (Execution Manager) receives this instantly and:
-      1. Sets its internal _halted flag — no more orders accepted.
-      2. Calls cancel_open_orders() on Binance.
-      3. Exits cleanly.
-
-    Returns 200 with how many pipeline processes were notified.
-    Returns 503 if Redis is unreachable (kill switch could not be delivered).
-    """
-    global _kill_fired, _kill_timestamp
+def _read_last_trades(csv_file: Path, limit: int = TRADES_LIMIT) -> list[dict[str, str]]:
+    if not csv_file.exists():
+        return []
 
     try:
-        subscribers = publish_control(r, "HALT")
-    except redis.exceptions.RedisError as exc:
+        with csv_file.open("r", newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None:
+                return []
+            rows = deque(reader, maxlen=limit)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        log.error("Failed reading trades CSV: %s", exc)
+        raise HTTPException(status_code=500, detail="Unable to read trades log") from exc
+
+    return [_normalize_trade_row(dict(row)) for row in reversed(rows)]
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "online", "service": "api-gateway"}
+
+
+@app.post("/api/kill")
+async def kill_pipeline() -> dict[str, str]:
+    try:
+        await _publish_control("HALT")
+    except aioredis.RedisError as exc:
         log.error("Failed to publish HALT: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Redis unreachable — HALT not delivered: {exc}",
-        )
+        raise HTTPException(status_code=503, detail="Failed to publish HALT command") from exc
 
-    _kill_fired     = True
-    _kill_timestamp = time.time()
-
-    log.warning("Kill switch activated. Pipeline halted.")
-
-    return JSONResponse({
-        "command":     "HALT",
-        "channel":     CONTROL_CHANNEL,
-        "subscribers": subscribers,
-        "result":      "HALT published successfully",
-    })
+    return {"status": "ok", "message": "Pipeline halting", "command": "HALT"}
 
 
-@app.post("/start-again", tags=["control"], status_code=status.HTTP_200_OK)
-def start_again(r: redis.Redis = Depends(get_redis)) -> JSONResponse:
-    """
-    Resume trading after a prior HALT.
-
-    Publishes {"command": "START"} to the Redis `control` channel so
-    Process C clears its paused state and resumes consuming trade signals.
-    """
-    global _kill_fired, _kill_timestamp
-
+@app.post("/api/resume")
+async def resume_pipeline() -> dict[str, str]:
     try:
-        subscribers = publish_control(r, "START")
-    except redis.exceptions.RedisError as exc:
+        await _publish_control("START")
+    except aioredis.RedisError as exc:
         log.error("Failed to publish START: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Redis unreachable — START not delivered: {exc}",
-        )
+        raise HTTPException(status_code=503, detail="Failed to publish START command") from exc
 
-    _kill_fired = False
-    _kill_timestamp = None
-
-    log.info("Start-again command sent. Execution should resume if subscribed.")
-
-    return JSONResponse({
-        "command":     "START",
-        "channel":     CONTROL_CHANNEL,
-        "subscribers": subscribers,
-        "result":      "START published successfully",
-    })
+    return {"status": "ok", "message": "Pipeline resuming", "command": "START"}
 
 
-@app.get("/pnl", tags=["trading"])
-def get_pnl() -> JSONResponse:
-    """
-    Returns the current PnL summary derived from persisted fills.
-    Reflects state as of the last successful order fill.
-    """
+@app.get("/api/balance")
+async def get_balance() -> Any:
+    if not API_KEY or not SECRET_KEY:
+        raise HTTPException(status_code=500, detail="API_KEY/SECRET_KEY not configured")
+
+    timestamp_ms = _now_ms()
+    signature = _build_balance_signature(SECRET_KEY, timestamp_ms)
+
+    headers = {
+        "RST-API-KEY": API_KEY,
+        "MSG-SIGNATURE": signature,
+    }
+
+    params = {"timestamp": str(timestamp_ms)}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(BALANCE_URL, headers=headers, params=params)
+        except httpx.HTTPError as exc:
+            log.error("Balance request failed: %s", exc)
+            raise HTTPException(status_code=502, detail="Balance request failed") from exc
+
     try:
-        summary = db.get_pnl_summary()
-    except Exception as exc:
-        log.error("Failed to read PnL from DB: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"DB unavailable: {exc}",
-        )
-    return JSONResponse(summary)
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Invalid JSON response from exchange") from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=payload)
+
+    return payload
 
 
-@app.get("/trades", tags=["trading"])
-def get_trades(limit: int = 100) -> JSONResponse:
-    """
-    Returns the most recent fills, newest first.
-    Optional query param: ?limit=N (default 100).
-    """
+@app.get("/api/trades")
+async def get_trades() -> list[dict[str, str]]:
+    return _read_last_trades(CSV_FILE, limit=TRADES_LIMIT)
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    redis_client: aioredis.Redis = app.state.redis
+    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+
     try:
-        trades = db.get_trades(limit=limit)
-    except Exception as exc:
-        log.error("Failed to read trades from DB: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"DB unavailable: {exc}",
+        await pubsub.subscribe(
+            MARKET_DATA_CHANNEL,
+            TRADE_SIGNALS_CHANNEL,
+            SENTIMENT_SIGNALS_CHANNEL,
         )
-    return JSONResponse(trades)
+
+        while True:
+            message = await pubsub.get_message(timeout=1.0)
+            if message is None:
+                continue
+
+            if message.get("type") != "message":
+                continue
+
+            channel = str(message.get("channel", ""))
+            raw_data = message.get("data", "")
+
+            if isinstance(raw_data, bytes):
+                raw_text = raw_data.decode("utf-8", errors="replace")
+            else:
+                raw_text = str(raw_data)
+
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError:
+                data = {"raw": raw_text}
+
+            await websocket.send_json({"channel": channel, "data": data})
+
+    except WebSocketDisconnect:
+        log.info("WebSocket client disconnected cleanly.")
+    except aioredis.RedisError as exc:
+        log.error("Redis pubsub stream error: %s", exc)
+        with suppress(Exception):
+            await websocket.send_json({"error": "Redis stream unavailable"})
+    finally:
+        with suppress(Exception):
+            await pubsub.unsubscribe(
+                MARKET_DATA_CHANNEL,
+                TRADE_SIGNALS_CHANNEL,
+                SENTIMENT_SIGNALS_CHANNEL,
+            )
+        with suppress(Exception):
+            await pubsub.aclose()
+        with suppress(Exception):
+            await websocket.close()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api_gateway:app", host="0.0.0.0", port=8000, reload=False)
+
+    uvicorn.run("api_gateway:app", host="0.0.0.0", port=8000)

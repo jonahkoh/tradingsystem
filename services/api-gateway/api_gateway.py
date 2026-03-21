@@ -208,12 +208,19 @@ async def get_trades() -> list[dict[str, str]]:
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    log.info("WebSocket client connected to /ws/stream")
 
     redis_client: aioredis.Redis = app.state.redis
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
 
     try:
         await pubsub.subscribe(
+            MARKET_DATA_CHANNEL,
+            TRADE_SIGNALS_CHANNEL,
+            SENTIMENT_SIGNALS_CHANNEL,
+        )
+        log.info(
+            "WebSocket subscribed to channels: %s, %s, %s",
             MARKET_DATA_CHANNEL,
             TRADE_SIGNALS_CHANNEL,
             SENTIMENT_SIGNALS_CHANNEL,
@@ -241,6 +248,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
                 data = {"raw": raw_text}
 
             await websocket.send_json({"channel": channel, "data": data})
+            log.info("Forwarded websocket event from channel=%s", channel)
 
     except WebSocketDisconnect:
         log.info("WebSocket client disconnected cleanly.")
@@ -259,6 +267,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
             await pubsub.aclose()
         with suppress(Exception):
             await websocket.close()
+        log.info("WebSocket /ws/stream connection closed")
 
 
 if __name__ == "__main__":

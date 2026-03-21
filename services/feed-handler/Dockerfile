@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY services/feed-handler/feed-handler.py ./feed-handler.py
+COPY services/feed-handler/market_data.py ./market_data.py
 
-CMD ["python", "feed-handler.py"]
+CMD ["python", "market_data.py"]

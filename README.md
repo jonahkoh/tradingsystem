@@ -28,7 +28,7 @@ Services run in one Docker network and communicate through Redis channels.
 | Process | Main File |
 |---|---|
 | A | services/feed-handler/market_data.py |
-| B | services/strategy-engine/strategy_engine.py |
+| B | services/strategy-engine/btc_eth_strategy_engine.py |
 | C | services/execution-manager/execution_service.py |
 | D | services/ledger/ledger_service.py |
 | E | services/api-gateway/api_gateway.py |

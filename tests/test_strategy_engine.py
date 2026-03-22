@@ -19,10 +19,13 @@ class _RedisStub:
         self.messages.append((channel, payload))
         return 1
 
-    async def hset(self, key, mapping):
-        self.hashes[key] = dict(mapping)
+    async def hset(self, key, mapping=None, **kwargs):
+        if mapping:
+            self.hashes[key] = dict(mapping)
         return 1
 
+    async def hgetall(self, key):
+        return self.hashes.get(key, {})
 
 class StrategyEngineTests(unittest.TestCase):
     def setUp(self):

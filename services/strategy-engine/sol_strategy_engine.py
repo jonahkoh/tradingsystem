@@ -1,24 +1,29 @@
-"""Process H — SOL EMA Momentum Strategy Engine.
+"""Process H — SOL DCA (Dollar Cost Averaging) Strategy Engine.
 
-SOL is a high-beta, retail-driven asset. Unlike BTC/ETH it does NOT mean-revert
-reliably — capital floods in during ecosystem hype (DeFi, NFTs, memecoins) and
-the price trends for days. Trying to "buy the dip" on SOL during a network outage
-will get you liquidated.
+SOL is a high-beta, retail-driven asset that trends hard in both directions.
+In bearish/choppy markets, EMA crossover whipsaws repeatedly. DCA adapts by
+buying in tranches as price falls, lowering the average cost basis so that a
+partial recovery is enough to take profit.
 
-Strategy: EMA Crossover Momentum with ATR Stop-Loss
-─────────────────────────────────────────────────────
-  ENTRY  — fast EMA crosses above slow EMA (golden cross)
-            AND global sentiment is not in SEVERE_FEAR
-            (only suppress entries in extreme panic — SOL moves in all other regimes)
+Strategy: DCA Tranche Buying with Sentiment-Scaled Sizing
+──────────────────────────────────────────────────────────
+  ENTRY 1 — First tranche: price dips INITIAL_DIP_PCT% below SMA(20)
+             AND sentiment > SENTIMENT_GATE
+  ENTRY N — Each subsequent tranche: price dips TRANCHE_DIP_PCT% below
+             the previous buy price, up to MAX_TRANCHES total
 
-  EXIT 1 — ATR stop-loss: price drops > ATR_STOPLOSS_K × ATR from entry
-            (wide stop to avoid being shaken out by normal momentum pullbacks)
-  EXIT 2 — Death cross: fast EMA crosses below slow EMA (trend reversal confirmed)
+  EXIT 1  — Take-profit: price >= average_cost × (1 + PROFIT_MARGIN)
+             Sells ALL tranches in one signal
+  EXIT 2  — ATR stop-loss: price drops > ATR_STOPLOSS_K × ATR from average_cost
+             Safety net against catastrophic drops
 
-EMA update uses standard formula: EMA_t = α × price_t + (1 - α) × EMA_{t-1}
-  where α = 2 / (period + 1)
+Tranche size is sentiment-scaled:
+  SEVERE_FEAR → 0.5×  (capital preservation)
+  UNEASE      → 0.75×
+  NEUTRAL     → 1.0×
+  HYPE        → 1.2×  (higher conviction)
 
-ATR uses Wilder's smoothing (same as XRP and BTC/ETH strategies).
+ATR uses Wilder's smoothing (same as all other strategies).
 
 Subscribes to:
     market_data       — mid_price ticks (filtered to TRADE_SYMBOL only)
@@ -59,42 +64,35 @@ EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 TRADE_SYMBOL       = "SOL/USD"
 DEFAULT_ORDER_TYPE = "MARKET"
 
-# EMA periods.
-# At 5-second polling: fast=20 ≈ 100s, slow=50 ≈ 250s.
-# The golden/death cross provides a trend signal with ~2.5× separation.
-EMA_FAST_PERIOD = int(os.getenv("SOL_EMA_FAST_PERIOD", "20"))
-EMA_SLOW_PERIOD = int(os.getenv("SOL_EMA_SLOW_PERIOD", "50"))
+# DCA strategy parameters.
+PROFIT_MARGIN   = float(os.getenv("SOL_DCA_PROFIT_MARGIN",  "0.02"))   # 2% take-profit above avg cost
+INITIAL_DIP_PCT = float(os.getenv("SOL_DCA_INITIAL_DIP",    "0.01"))   # 1% below SMA for first tranche
+TRANCHE_DIP_PCT = float(os.getenv("SOL_DCA_TRANCHE_DIP",    "0.015"))  # 1.5% below last buy for next
+MAX_TRANCHES    = int(os.getenv("SOL_DCA_MAX_TRANCHES",      "5"))
+SMA_PERIOD      = int(os.getenv("SOL_DCA_SMA_PERIOD",        "20"))
+SENTIMENT_GATE  = float(os.getenv("SOL_DCA_SENTIMENT_GATE",  "-0.30"))
 
-# ATR stop-loss — wider than mean-reversion (2.0×) to avoid shaking out during momentum pullbacks.
-ATR_PERIOD      = int(os.getenv("SOL_ATR_PERIOD",      "14"))
-ATR_STOPLOSS_K  = float(os.getenv("SOL_ATR_STOPLOSS_K", "2.0"))
+# Sentiment scalars for tranche sizing — mirrors BTC/ETH strategy regime thresholds.
+SENTIMENT_SCALAR_SEVERE_FEAR = float(os.getenv("SOL_DCA_SCALAR_SEVERE_FEAR", "0.5"))
+SENTIMENT_SCALAR_UNEASE      = float(os.getenv("SOL_DCA_SCALAR_UNEASE",      "0.75"))
+SENTIMENT_SCALAR_NEUTRAL     = float(os.getenv("SOL_DCA_SCALAR_NEUTRAL",     "1.0"))
+SENTIMENT_SCALAR_HYPE        = float(os.getenv("SOL_DCA_SCALAR_HYPE",        "1.2"))
+
+# ATR stop-loss — safety net for catastrophic drawdowns.
+ATR_PERIOD      = int(os.getenv("SOL_ATR_PERIOD",               "14"))
+ATR_STOPLOSS_K  = float(os.getenv("SOL_ATR_STOPLOSS_K",          "2.0"))
 FALLBACK_STOP   = float(os.getenv("SOL_FALLBACK_STOP_MULTIPLIER", "0.95"))  # 5% fixed fallback
 
-# Sentiment gate — hard floor; entry blocked below this regardless of spread.
-SENTIMENT_ENTRY_GATE = float(os.getenv("SOL_SENTIMENT_ENTRY_GATE", "-0.30"))
-
-# Sentiment-scaled minimum EMA spread (fast − slow) as a fraction of price.
-# In fearful regimes, demand a wider spread to confirm real momentum — prevents
-# entering on weak/noisy crossovers that immediately reverse.
-# Defaults: SEVERE_FEAR=0.40%, UNEASE=0.25%, NEUTRAL=0.15%, HYPE=0.05%
-SOL_SPREAD_SEVERE_FEAR = float(os.getenv("SOL_SPREAD_SEVERE_FEAR", "0.0040"))
-SOL_SPREAD_UNEASE      = float(os.getenv("SOL_SPREAD_UNEASE",      "0.0025"))
-SOL_SPREAD_NEUTRAL     = float(os.getenv("SOL_SPREAD_NEUTRAL",     "0.0015"))
-SOL_SPREAD_HYPE        = float(os.getenv("SOL_SPREAD_HYPE",        "0.0005"))
-
 # Portfolio sizing — SOL gets 20% of portfolio.
-PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",   "1000000"))
-SOL_ALLOCATION   = float(os.getenv("SOL_ALLOCATION",  "0.20"))
+PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",  "1000000"))
+SOL_ALLOCATION   = float(os.getenv("SOL_ALLOCATION", "0.20"))
 TARGET_ORDER_USD = PORTFOLIO_USD * SOL_ALLOCATION
 
-TRADING_FEE_RATE  = float(os.getenv("TRADING_FEE_RATE",            "0.001"))
-# Minimum price multiplier before death-cross exit fires — covers 0.2% round-trip fees + buffer.
-# Death cross at +0.14% still loses money after fees; this guard prevents that.
-MIN_SELL_MULTIPLIER = float(os.getenv("SOL_MIN_SELL_MULTIPLIER", "1.003"))
-POLL_TIMEOUT_SEC  = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
-RETRY_DELAY_SEC   = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
-COOLDOWN_SECONDS  = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",       "3600"))
-CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC", "60"))
+TRADING_FEE_RATE         = float(os.getenv("TRADING_FEE_RATE",            "0.001"))
+POLL_TIMEOUT_SEC         = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC",   "1.0"))
+RETRY_DELAY_SEC          = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",      "5"))
+COOLDOWN_SECONDS         = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",        "3600"))
+CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC",    "60"))
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -107,12 +105,8 @@ log = logging.getLogger(__name__)
 
 
 # ── Strategy State ─────────────────────────────────────────────────────────────
-# EMA state
-fast_ema: float | None = None   # EMA(EMA_FAST_PERIOD)
-slow_ema: float | None = None   # EMA(EMA_SLOW_PERIOD)
-prev_fast_ema: float | None = None   # previous tick fast EMA (for crossover detection)
-prev_slow_ema: float | None = None   # previous tick slow EMA
-tick_count: int = 0   # ticks received; crossover logic waits until >= EMA_SLOW_PERIOD
+# SMA window for initial dip detection
+sma_prices: deque[float] = deque(maxlen=SMA_PERIOD)
 
 # ATR state for stop-loss
 atr_true_ranges: deque[float] = deque(maxlen=ATR_PERIOD)
@@ -126,8 +120,12 @@ global_sentiment_score: float = 0.0
 # Position state
 in_position: bool           = False
 open_position_quantity: str = "0.0000"
-entry_price: float          = 0.0
-atr_at_entry: float         = 0.0   # ATR snapshot at entry — stop-loss anchor
+average_cost: float         = 0.0   # weighted average cost across all tranches
+atr_at_entry: float         = 0.0   # ATR snapshot at first entry — stop-loss anchor
+
+# DCA tranche tracking
+tranche_count: int    = 0     # number of tranches bought
+last_buy_price: float = 0.0   # price of last confirmed BUY — anchor for next dip
 
 # Execution handshake
 pending_action: str | None  = None
@@ -150,19 +148,6 @@ def _handle_shutdown(signum: int, frame: Any) -> None:
 
 signal.signal(signal.SIGINT,  _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
-
-
-# ── EMA Computation ────────────────────────────────────────────────────────────
-def _update_ema(prev: float | None, price: float, period: int) -> float:
-    """
-    Standard EMA update: EMA_t = α × price_t + (1-α) × EMA_{t-1}
-    where α = 2 / (period + 1).
-    Seeds from the first price when prev is None.
-    """
-    if prev is None:
-        return price
-    alpha = 2.0 / (period + 1)
-    return alpha * price + (1.0 - alpha) * prev
 
 
 # ── ATR Computation (Wilder's Smoothing) ───────────────────────────────────────
@@ -191,29 +176,32 @@ def _compute_atr(current_price: float) -> float | None:
 
 
 def _target_quantity(price: float) -> str:
-    """Floor-divide target notional by price to whole units (Roostoo integer step size)."""
+    """Floor-divide full target notional by price to whole units."""
     if price <= 0:
         return "0"
     qty = int(math.floor(TARGET_ORDER_USD / price))
     return str(qty)
 
 
-def _required_ema_spread(sentiment: float) -> float:
-    """Return the minimum (fast_ema - slow_ema) / price needed to enter.
+def _sentiment_scalar() -> float:
+    """Map current sentiment score to a tranche size multiplier."""
+    score = global_sentiment_score
+    if score < -0.30:
+        return SENTIMENT_SCALAR_SEVERE_FEAR
+    if score < -0.05:
+        return SENTIMENT_SCALAR_UNEASE
+    if score <= 0.25:
+        return SENTIMENT_SCALAR_NEUTRAL
+    return SENTIMENT_SCALAR_HYPE
 
-    Maps sentiment score to a spread threshold:
-      SEVERE_FEAR (< -0.30) → 0.40% — demand strong conviction
-      UNEASE      (< -0.05) → 0.25%
-      NEUTRAL     (≤  0.25) → 0.15%
-      HYPE        (>  0.25) → 0.05% — momentum regime, lower bar
-    """
-    if sentiment < -0.30:
-        return SOL_SPREAD_SEVERE_FEAR
-    if sentiment < -0.05:
-        return SOL_SPREAD_UNEASE
-    if sentiment <= 0.25:
-        return SOL_SPREAD_NEUTRAL
-    return SOL_SPREAD_HYPE
+
+def _tranche_quantity(price: float) -> str:
+    """One tranche = (TARGET_ORDER_USD / MAX_TRANCHES) × sentiment_scalar, in whole units."""
+    if price <= 0:
+        return "0"
+    tranche_usd = (TARGET_ORDER_USD / MAX_TRANCHES) * _sentiment_scalar()
+    qty = int(math.floor(tranche_usd / price))
+    return str(qty)
 
 
 # ── State Persistence ──────────────────────────────────────────────────────────
@@ -222,16 +210,19 @@ async def _save_state(redis_client: aioredis.Redis) -> None:
         await redis_client.hset(STATE_KEY, mapping={
             "in_position":            str(in_position),
             "open_position_quantity": open_position_quantity,
-            "entry_price":            str(entry_price),
+            "average_cost":           str(average_cost),
             "atr_at_entry":           str(atr_at_entry),
             "cooldown_until":         str(cooldown_until),
+            "tranche_count":          str(tranche_count),
+            "last_buy_price":         str(last_buy_price),
         })
     except aioredis.RedisError as exc:
         log.warning("Failed to persist state: %s", exc)
 
 
 async def _load_state(redis_client: aioredis.Redis) -> bool:
-    global in_position, open_position_quantity, entry_price, atr_at_entry, cooldown_until
+    global in_position, open_position_quantity, average_cost, atr_at_entry
+    global cooldown_until, tranche_count, last_buy_price
     try:
         state = await redis_client.hgetall(STATE_KEY)
     except aioredis.RedisError as exc:
@@ -241,12 +232,30 @@ async def _load_state(redis_client: aioredis.Redis) -> bool:
         return False
     in_position            = state.get("in_position", "False") == "True"
     open_position_quantity = state.get("open_position_quantity", "0")
-    entry_price            = float(state.get("entry_price",    "0.0"))
-    atr_at_entry           = float(state.get("atr_at_entry",  "0.0"))
-    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    average_cost           = float(state.get("average_cost",    "0.0"))
+    atr_at_entry           = float(state.get("atr_at_entry",    "0.0"))
+    cooldown_until         = float(state.get("cooldown_until",  "0.0"))
+    tranche_count          = int(float(state.get("tranche_count",  "0")))
+    last_buy_price         = float(state.get("last_buy_price",  "0.0"))
+
+    # Migration shim: old state used entry_price — promote it to average_cost.
+    if in_position and average_cost == 0.0:
+        legacy = float(state.get("entry_price", "0.0"))
+        if legacy > 0:
+            average_cost = legacy
+            log.warning("Migrated legacy entry_price=%.4f to average_cost.", average_cost)
+
+    # Defensive: if not in position, tranche state must be clean.
+    if not in_position:
+        tranche_count  = 0
+        last_buy_price = 0.0
+        average_cost   = 0.0
+
     log.info(
-        "Resumed persisted state: in_position=%s qty=%s entry=%.4f atr_entry=%.6f",
-        in_position, open_position_quantity, entry_price, atr_at_entry,
+        "Resumed persisted state: in_position=%s qty=%s avg_cost=%.4f "
+        "tranches=%d last_buy=%.4f atr_entry=%.6f",
+        in_position, open_position_quantity, average_cost,
+        tranche_count, last_buy_price, atr_at_entry,
     )
     return True
 
@@ -289,58 +298,42 @@ async def evaluate_market_tick(
     timestamp: int,
     redis_client: aioredis.Redis,
 ) -> None:
-    global fast_ema, slow_ema, prev_fast_ema, prev_slow_ema, tick_count
+    global average_cost, tranche_count, last_buy_price, atr_at_entry
     global pending_action, pending_action_since, in_position, open_position_quantity
-    global entry_price, atr_at_entry, cooldown_until, pending_sell_quantity
+    global cooldown_until, pending_sell_quantity
     global boot_liquidation_pending
 
     # Guard: only process ticks for this strategy's symbol.
     if symbol != TRADE_SYMBOL:
         return
 
+    # Guard: zero/negative prices cause division errors.
+    if price <= 0:
+        return
+
     # ── ATR update ───────────────────────────────────────────────────────────
     current_atr = _compute_atr(price)
 
-    # ── EMA update ───────────────────────────────────────────────────────────
-    # Capture previous values BEFORE updating (needed for crossover detection).
-    prev_fast_ema = fast_ema
-    prev_slow_ema = slow_ema
+    # ── SMA update ───────────────────────────────────────────────────────────
+    sma_prices.append(price)
 
-    fast_ema   = _update_ema(fast_ema, price, EMA_FAST_PERIOD)
-    slow_ema   = _update_ema(slow_ema, price, EMA_SLOW_PERIOD)
-    tick_count += 1
-
-    # ── Warm-up ──────────────────────────────────────────────────────────────
-    if tick_count < EMA_SLOW_PERIOD:
-        log.info(
-            "EMA warm-up: %d/%d ticks | fast_ema=%.6f slow_ema=%.6f",
-            tick_count, EMA_SLOW_PERIOD, fast_ema, slow_ema,
-        )
+    # ── SMA warm-up ──────────────────────────────────────────────────────────
+    if len(sma_prices) < SMA_PERIOD:
+        log.info("SMA warm-up: %d/%d prices.", len(sma_prices), SMA_PERIOD)
         return
 
-    # ── Crossover detection ──────────────────────────────────────────────────
-    fast_above_slow      = fast_ema > slow_ema
-    prev_fast_above_slow = (
-        prev_fast_ema > prev_slow_ema
-        if (prev_fast_ema is not None and prev_slow_ema is not None)
-        else fast_above_slow   # default to current state if no previous — no crossover
-    )
-    golden_cross = fast_above_slow and not prev_fast_above_slow
-    death_cross  = not fast_above_slow and prev_fast_above_slow
-
-    # ── Tick log ─────────────────────────────────────────────────────────────
+    sma    = sum(sma_prices) / SMA_PERIOD
     now_ts = time.time()
     state  = "IN_POSITION" if in_position else "OUT_OF_POSITION"
-    spread = fast_ema - slow_ema
+    tp_price = average_cost * (1.0 + PROFIT_MARGIN) if average_cost > 0 else 0.0
+
     log.info(
-        "px=%.6f | fast=%.6f slow=%.6f spread=%.6f | ATR=%.6f | "
-        "senti=%.4f | %s%s | state=%s | cooldown=%.0fs",
-        price, fast_ema, slow_ema, spread,
+        "px=%.6f | SMA=%.6f | avg_cost=%.6f | tranches=%d/%d | ATR=%.6f | "
+        "senti=%.4f (%.2f×) | %s | tp=%.6f | cooldown=%.0fs",
+        price, sma, average_cost, tranche_count, MAX_TRANCHES,
         current_atr if current_atr else 0.0,
-        global_sentiment_score,
-        "GOLDEN_CROSS " if golden_cross else "",
-        "DEATH_CROSS "  if death_cross  else "",
-        state,
+        global_sentiment_score, _sentiment_scalar(),
+        state, tp_price,
         max(cooldown_until - now_ts, 0.0),
     )
 
@@ -360,54 +353,73 @@ async def evaluate_market_tick(
         log.info("Signal suppressed: awaiting startup liquidation.")
         return
 
-    # ── Entry: Golden Cross + Sentiment-Scaled Spread Filter ─────────────────
-    min_spread_pct  = _required_ema_spread(global_sentiment_score)
-    actual_spread   = (fast_ema - slow_ema) / price if price > 0 else 0.0
-    spread_ok       = actual_spread >= min_spread_pct
-
-    if not spread_ok and golden_cross:
-        log.info(
-            "Golden cross suppressed (spread too narrow): spread=%.4f%% < required=%.4f%% | senti=%.4f",
-            actual_spread * 100, min_spread_pct * 100, global_sentiment_score,
-        )
-
+    # ── Entry: First Tranche ──────────────────────────────────────────────────
     if (
         not in_position
+        and tranche_count == 0
         and now_ts > cooldown_until
-        and golden_cross
-        and global_sentiment_score > SENTIMENT_ENTRY_GATE
-        and spread_ok
+        and price <= sma * (1.0 - INITIAL_DIP_PCT)
+        and global_sentiment_score > SENTIMENT_GATE
     ):
-        quantity             = _target_quantity(price)
+        quantity = _tranche_quantity(price)
+        if int(quantity) <= 0:
+            log.warning("First tranche quantity rounds to 0 at price=%.6f — skipping.", price)
+            return
         pending_action       = "BUY"
         pending_action_since = time.time()
-        entry_price          = price
-
-        # ATR stop-loss with fixed fallback.
-        if current_atr and current_atr > 0:
-            atr_at_entry = current_atr
-            stop_price   = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
-            log.info(
-                "Golden cross BUY: entry=%.6f ATR=%.6f stop=%.6f spread=%.4f%% senti=%.4f",
-                entry_price, atr_at_entry, stop_price, actual_spread * 100, global_sentiment_score,
-            )
-        else:
-            atr_at_entry = 0.0
-            log.info(
-                "Golden cross BUY: entry=%.6f (ATR not seeded, fallback stop %.0f%%) spread=%.4f%% senti=%.4f",
-                entry_price, (1.0 - FALLBACK_STOP) * 100, actual_spread * 100, global_sentiment_score,
-            )
-
+        # Provisional average_cost — updated on confirmation with actual fill price.
+        average_cost         = price
+        last_buy_price       = price
+        atr_at_entry         = current_atr if current_atr and current_atr > 0 else 0.0
         await _publish_signal(
             redis_client,
             action="BUY",
             symbol=symbol,
             quantity=quantity,
-            reason=f"Golden_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}_spread={actual_spread*100:.3f}pct_senti={global_sentiment_score:.3f}",
+            reason=(
+                f"DCA_Tranche1_dip={INITIAL_DIP_PCT*100:.1f}pct"
+                f"_sma={sma:.4f}_senti={global_sentiment_score:.3f}"
+                f"_scalar={_sentiment_scalar():.2f}x"
+            ),
             timestamp=timestamp,
             expected_price=price,
         )
         return
+
+    # ── Entry: Additional Tranches ────────────────────────────────────────────
+    if (
+        in_position
+        and tranche_count < MAX_TRANCHES
+        and last_buy_price > 0
+        and price <= last_buy_price * (1.0 - TRANCHE_DIP_PCT)
+        and now_ts > cooldown_until
+        and global_sentiment_score > SENTIMENT_GATE
+    ):
+        quantity = _tranche_quantity(price)
+        if int(quantity) <= 0:
+            log.warning(
+                "Tranche %d quantity rounds to 0 at price=%.6f — skipping.",
+                tranche_count + 1, price,
+            )
+            # Fall through to exit checks.
+        else:
+            pending_action       = "BUY"
+            pending_action_since = time.time()
+            last_buy_price       = price   # provisional; confirmed in handler
+            await _publish_signal(
+                redis_client,
+                action="BUY",
+                symbol=symbol,
+                quantity=quantity,
+                reason=(
+                    f"DCA_Tranche{tranche_count + 1}_dip={TRANCHE_DIP_PCT*100:.1f}pct"
+                    f"_last={last_buy_price:.4f}_senti={global_sentiment_score:.3f}"
+                    f"_scalar={_sentiment_scalar():.2f}x"
+                ),
+                timestamp=timestamp,
+                expected_price=price,
+            )
+            return
 
     # No exits to evaluate if flat.
     if not in_position:
@@ -415,9 +427,9 @@ async def evaluate_market_tick(
 
     # Compute stop price from ATR captured at entry (or fallback).
     if atr_at_entry > 0:
-        stop_loss_price = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
+        stop_loss_price = average_cost - (ATR_STOPLOSS_K * atr_at_entry)
     else:
-        stop_loss_price = entry_price * FALLBACK_STOP
+        stop_loss_price = average_cost * FALLBACK_STOP
 
     # ── Exit 1: ATR Stop-Loss ─────────────────────────────────────────────────
     if price <= stop_loss_price:
@@ -436,45 +448,41 @@ async def evaluate_market_tick(
             expected_price=price,
         )
         log.warning(
-            "ATR stop-loss triggered: px=%.6f entry=%.6f stop=%.6f atr_entry=%.6f",
-            price, entry_price, stop_loss_price, atr_at_entry,
+            "ATR stop-loss triggered: px=%.6f avg_cost=%.6f stop=%.6f atr_entry=%.6f tranches=%d",
+            price, average_cost, stop_loss_price, atr_at_entry, tranche_count,
         )
         return
 
-    # ── Exit 2: Death Cross (trend reversal) ──────────────────────────────────
-    if death_cross:
-        min_exit_price = entry_price * MIN_SELL_MULTIPLIER
-        if price < min_exit_price:
-            log.info(
-                "Death cross suppressed (fee guard): px=%.6f < min=%.6f (entry=%.6f × %.4f) pnl=%.2f%%",
-                price, min_exit_price, entry_price, MIN_SELL_MULTIPLIER,
-                (price / entry_price - 1.0) * 100,
-            )
-        else:
-            sell_qty              = open_position_quantity
-            pending_action        = "SELL"
-            pending_action_since  = time.time()
-            pending_sell_quantity = sell_qty
-            await _publish_signal(
-                redis_client,
-                action="SELL",
-                symbol=symbol,
-                quantity=sell_qty,
-                reason=f"Death_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}",
-                timestamp=timestamp,
-                expected_price=price,
-            )
-            log.info(
-                "Death cross exit: px=%.6f entry=%.6f pnl=%.2f%%",
-                price, entry_price, (price / entry_price - 1.0) * 100,
-            )
+    # ── Exit 2: Take-Profit ───────────────────────────────────────────────────
+    take_profit_price = average_cost * (1.0 + PROFIT_MARGIN)
+    if price >= take_profit_price:
+        sell_qty              = open_position_quantity
+        pending_action        = "SELL"
+        pending_action_since  = time.time()
+        pending_sell_quantity = sell_qty
+        await _publish_signal(
+            redis_client,
+            action="SELL",
+            symbol=symbol,
+            quantity=sell_qty,
+            reason=f"DCA_TakeProfit_{int(PROFIT_MARGIN*100)}pct_avg={average_cost:.4f}",
+            timestamp=timestamp,
+            expected_price=price,
+        )
+        log.info(
+            "DCA take-profit triggered: px=%.6f avg_cost=%.6f target=%.6f "
+            "gain=%.2f%% tranches=%d",
+            price, average_cost, take_profit_price,
+            (price / average_cost - 1.0) * 100, tranche_count,
+        )
         return
 
 
 # ── Execution Confirmation Handler ─────────────────────────────────────────────
 async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis.Redis) -> None:
-    global in_position, open_position_quantity, pending_action, entry_price
+    global in_position, open_position_quantity, pending_action, average_cost
     global atr_at_entry, pending_sell_quantity, boot_liquidation_pending
+    global tranche_count, last_buy_price
 
     try:
         data = json.loads(raw_payload)
@@ -503,14 +511,15 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         }:
             return
 
-        # Clear regardless of result — a failed liquidation means nothing was held (already clean).
         boot_liquidation_pending = False
         pending_action           = None
         pending_sell_quantity    = "0.0000"
         in_position              = False
         open_position_quantity   = "0.0000"
-        entry_price              = 0.0
+        average_cost             = 0.0
         atr_at_entry             = 0.0
+        tranche_count            = 0
+        last_buy_price           = 0.0
         await _save_state(redis_client)
         if result == "SUCCESS":
             log.info("Startup liquidation completed for %s.", TRADE_SYMBOL)
@@ -522,18 +531,21 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         return
 
     if side != pending_action:
-        log.info(
-            "Ignoring out-of-order fill: side=%s while pending=%s", side, pending_action,
-        )
+        log.info("Ignoring out-of-order fill: side=%s while pending=%s", side, pending_action)
         return
 
     if result != "SUCCESS":
         log.warning("%s fill failed (result=%s). Reverting pending state.", side, result)
         if side == "BUY":
-            in_position            = False
-            open_position_quantity = "0.0000"
-            entry_price            = 0.0
-            atr_at_entry           = 0.0
+            if tranche_count == 0:
+                # First tranche failed — full revert.
+                in_position            = False
+                open_position_quantity = "0.0000"
+                average_cost           = 0.0
+                atr_at_entry           = 0.0
+                last_buy_price         = 0.0
+            # For nth tranche failures, preserve the existing position — tranche_count
+            # is NOT incremented on failure, so state remains consistent.
         elif side == "SELL":
             in_position = True
             if open_position_quantity in {"", "0", "0.0", "0.0000"}:
@@ -548,15 +560,25 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         executed_qty = 0.0
 
     if side == "BUY":
-        net_qty                = int(math.floor(executed_qty * (1.0 - TRADING_FEE_RATE)))
-        in_position            = net_qty > 0
-        open_position_quantity = str(net_qty)
-        pending_sell_quantity  = "0"
-        pending_action         = None
+        net_qty = int(math.floor(executed_qty * (1.0 - TRADING_FEE_RATE)))
+        if net_qty > 0:
+            prev_qty      = int(float(open_position_quantity)) if in_position else 0
+            new_total_qty = prev_qty + net_qty
+            # Weighted average cost update.
+            buy_price    = last_buy_price if last_buy_price > 0 else average_cost
+            average_cost = (average_cost * prev_qty + buy_price * net_qty) / new_total_qty
+            open_position_quantity = str(new_total_qty)
+            in_position   = True
+            tranche_count += 1
+            last_buy_price = buy_price
+        pending_sell_quantity = "0"
+        pending_action        = None
         await _save_state(redis_client)
         log.info(
-            "BUY confirmed: executed=%.8f fee_rate=%.4f net_qty=%s entry=%.6f",
-            executed_qty, TRADING_FEE_RATE, open_position_quantity, entry_price,
+            "BUY confirmed (tranche %d/%d): executed=%.8f net_qty=%d "
+            "total_qty=%s avg_cost=%.6f last_buy=%.6f",
+            tranche_count, MAX_TRANCHES,
+            executed_qty, net_qty, open_position_quantity, average_cost, last_buy_price,
         )
 
     elif side == "SELL":
@@ -570,13 +592,15 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         open_position_quantity = f"{remaining:.4f}"
         pending_sell_quantity  = "0.0000"
         if remaining <= 0.0:
-            entry_price  = 0.0
-            atr_at_entry = 0.0
+            average_cost   = 0.0
+            atr_at_entry   = 0.0
+            tranche_count  = 0
+            last_buy_price = 0.0
         pending_action = None
         await _save_state(redis_client)
         log.info(
-            "SELL confirmed: executed=%.8f remaining_qty=%s",
-            executed_qty, open_position_quantity,
+            "SELL confirmed: executed=%.8f remaining_qty=%s tranches_reset=%s",
+            executed_qty, open_position_quantity, remaining <= 0.0,
         )
 
 
@@ -594,8 +618,8 @@ def handle_sentiment_update(raw_payload: str) -> None:
     prev               = global_sentiment_score
     global_sentiment_score = score
     log.info(
-        "Global sentiment updated: %.4f → %.4f | entry_gate=%.2f",
-        prev, global_sentiment_score, SENTIMENT_ENTRY_GATE,
+        "Global sentiment updated: %.4f → %.4f | gate=%.2f | scalar=%.2f×",
+        prev, global_sentiment_score, SENTIMENT_GATE, _sentiment_scalar(),
     )
 
 
@@ -666,8 +690,9 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
 
 # ── Startup Liquidation ────────────────────────────────────────────────────────
 async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
-    global in_position, open_position_quantity, pending_action, entry_price
+    global in_position, open_position_quantity, pending_action, average_cost
     global atr_at_entry, cooldown_until, pending_sell_quantity, boot_liquidation_pending
+    global tranche_count, last_buy_price
 
     payload = {
         "action":   "SELL",
@@ -686,10 +711,12 @@ async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
     in_position              = False
     open_position_quantity   = "0.0000"
     pending_action           = "SELL"
-    entry_price              = 0.0
+    average_cost             = 0.0
     atr_at_entry             = 0.0
     cooldown_until           = 0.0
     pending_sell_quantity    = "0.0000"
+    tranche_count            = 0
+    last_buy_price           = 0.0
     log.info("Startup clean-slate liquidation signal published for %s.", TRADE_SYMBOL)
 
 
@@ -698,15 +725,14 @@ async def run() -> None:
     global boot_liquidation_done
 
     log.info(
-        "SOL Momentum Strategy starting | symbol=%s | "
-        "ema_fast=%d (≈%ds) | ema_slow=%d (≈%ds) | "
-        "atr_period=%d | atr_stop_k=%.2f | "
-        "sentiment_gate=%.2f | target_notional=$%.2f (%.0f%% of $%.0f)",
+        "SOL DCA Strategy starting | symbol=%s | "
+        "profit_margin=%.1f%% | initial_dip=%.1f%% | tranche_dip=%.1f%% | "
+        "max_tranches=%d | sma_period=%d | sentiment_gate=%.2f | "
+        "atr_period=%d | atr_stop_k=%.2f | target_notional=$%.2f (%.0f%% of $%.0f)",
         TRADE_SYMBOL,
-        EMA_FAST_PERIOD, EMA_FAST_PERIOD * 5,
-        EMA_SLOW_PERIOD, EMA_SLOW_PERIOD * 5,
+        PROFIT_MARGIN * 100, INITIAL_DIP_PCT * 100, TRANCHE_DIP_PCT * 100,
+        MAX_TRANCHES, SMA_PERIOD, SENTIMENT_GATE,
         ATR_PERIOD, ATR_STOPLOSS_K,
-        SENTIMENT_ENTRY_GATE,
         TARGET_ORDER_USD, SOL_ALLOCATION * 100, PORTFOLIO_USD,
     )
 

@@ -9,7 +9,7 @@ from collections import deque
 from tests.test_loader import load_module
 
 
-sol = load_module("sol_strategy_mod", "services/sol-strategy/sol_strategy_engine.py")
+sol = load_module("sol_strategy_mod", "services/strategy-engine/sol_strategy_engine.py")
 
 
 class _RedisStub:

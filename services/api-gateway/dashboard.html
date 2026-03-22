@@ -190,7 +190,7 @@ const WS_URL = `ws://${window.location.host}/ws/stream`;
 const COINS = [
   { sym: 'BTC/USD', name: 'BTC', strategy: 'Bollinger Band', pxDec: 2, qtyDec: 6, entryLbl: 'Entry' },
   { sym: 'ETH/USD', name: 'ETH', strategy: 'Bollinger Band', pxDec: 2, qtyDec: 4, entryLbl: 'Entry' },
-  { sym: 'SOL/USD', name: 'SOL', strategy: 'DCA Tranches',   pxDec: 2, qtyDec: 2, entryLbl: 'Avg Cost' },
+  { sym: 'SOL/USD', name: 'SOL', strategy: 'Multi-Regime',   pxDec: 2, qtyDec: 2, entryLbl: 'Avg Cost' },
   { sym: 'XRP/USD', name: 'XRP', strategy: 'ATR Breakout',   pxDec: 4, qtyDec: 0, entryLbl: 'Entry' },
   { sym: 'FET/USD', name: 'FET', strategy: 'ATR Breakout',   pxDec: 4, qtyDec: 0, entryLbl: 'Entry' },
 ];
@@ -308,15 +308,16 @@ function updateCard(sym, pos) {
     }
   }
 
-  // Extra row: tranches for SOL, stop for others
+  // Extra row: regime+tranches for SOL, stop for others
   const extraRow = document.getElementById(`extra-${n}`);
   const extraLbl = document.getElementById(`extraLbl-${n}`);
   const extraVal = document.getElementById(`extraVal-${n}`);
   if (extraRow && extraLbl && extraVal) {
     if (sym === 'SOL/USD') {
+      const regime = pos.entry_regime || 'UNCLEAR';
       extraRow.style.display = 'flex';
-      extraLbl.textContent   = 'Tranches';
-      extraVal.textContent   = `${tranch} / 5`;
+      extraLbl.textContent   = 'Regime';
+      extraVal.textContent   = inPos ? `${regime} (${tranch}/${pos.max_tranches || 5}T)` : regime;
     } else if (stop > 0) {
       extraRow.style.display = 'flex';
       extraLbl.textContent   = 'Stop';

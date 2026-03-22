@@ -503,8 +503,9 @@ async def get_all_positions() -> dict:
         entry    = float(state.get("average_cost") or state.get("entry_price", "0") or "0")
         stop_px  = float(state.get("stop_loss_price", "0") or "0")
         atr_entry = float(state.get("atr_at_entry", "0") or "0")
-        tranches = int(state.get("tranche_count", "0") or "0")
-        pending  = state.get("pending_action") or None
+        tranches     = int(state.get("tranche_count", "0") or "0")
+        entry_regime = state.get("entry_regime", "") or ""
+        pending      = state.get("pending_action") or None
         cooldown = float(state.get("cooldown_until", "0") or "0")
 
         current_price = latest_prices.get(sym)
@@ -520,6 +521,7 @@ async def get_all_positions() -> dict:
             "stop_loss_price":  stop_px,
             "atr_at_entry":     atr_entry,
             "tranche_count":    tranches,
+            "entry_regime":     entry_regime,
             "pending_action":   pending,
             "current_price":    current_price,
             "unrealized_pnl":   unrealized_pnl,

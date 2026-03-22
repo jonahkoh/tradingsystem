@@ -35,6 +35,7 @@ MARKET_DATA_CHANNEL = "market_data"
 SENTIMENT_CHANNEL = "sentiment_signals"
 TRADE_SIGNALS_CHANNEL = "trade_signals"
 ORDER_RESULTS_CHANNEL = "order_results"
+EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 
 DEFAULT_SYMBOL = os.getenv("TRADE_SYMBOL", "BTC/USD")
 DEFAULT_ORDER_TYPE = "MARKET"
@@ -118,7 +119,7 @@ def compute_bollinger_inputs(latest_prices: list[float]) -> tuple[float, float]:
 def target_quantity_from_price(price: float) -> str:
     if price <= 0:
         return "0.0000"
-    qty = TARGET_ORDER_USD / price
+    qty = math.floor((TARGET_ORDER_USD / price) * 10000) / 10000
     return f"{qty:.4f}"
 
 
@@ -130,6 +131,7 @@ async def publish_signal(
     quantity: str,
     reason: str,
     timestamp: int,
+    expected_price: float,
 ) -> None:
     payload: dict[str, Any] = {
         "action": action,
@@ -138,6 +140,7 @@ async def publish_signal(
         "quantity": quantity,
         "reason": reason,
         "timestamp": timestamp,
+        "expected_price": expected_price,
     }
     await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
     log.info("Signal published → %s", payload)
@@ -189,8 +192,6 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
 
     if not in_position and now_ts > cooldown_until and price < dynamic_lower:
         pending_action = "BUY"
-        in_position = True
-        open_position_quantity = quantity
         entry_price = price
         stop_loss_price = entry_price * STOP_LOSS_MULTIPLIER
         await publish_signal(
@@ -200,6 +201,7 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
             quantity=quantity,
             reason=str(profile["reason"]),
             timestamp=timestamp,
+            expected_price=price,
         )
         return
 
@@ -207,7 +209,6 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
         pending_action = "SELL"
         sell_qty = open_position_quantity
         pending_sell_quantity = sell_qty
-        in_position = False
         await publish_signal(
             redis_client,
             action="SELL",
@@ -215,6 +216,7 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
             quantity=sell_qty,
             reason="Stop_Loss_3pct",
             timestamp=timestamp,
+            expected_price=price,
         )
         cooldown_until = now_ts + COOLDOWN_SECONDS
         log.warning("Stop-Loss triggered at -3%%.")
@@ -225,7 +227,6 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
         minimum_sell_price = entry_price * MIN_SELL_MULTIPLIER
         if price >= minimum_sell_price:
             pending_action = "SELL"
-            in_position = False
             sell_qty = open_position_quantity
             pending_sell_quantity = sell_qty
             await publish_signal(
@@ -235,6 +236,7 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
                 quantity=sell_qty,
                 reason="Mean_Reversion_TP",
                 timestamp=timestamp,
+                expected_price=price,
             )
             return
 
@@ -264,20 +266,41 @@ def _extract_executed_quantity(order_result: dict[str, Any]) -> float:
 
 
 def handle_order_result_update(raw_payload: str) -> None:
+    _ = raw_payload
+    # Position state is updated from execution_confirmations to avoid Pub/Sub blind spots.
+    return
+
+
+def handle_execution_confirmation(raw_payload: str) -> None:
     global in_position, open_position_quantity, pending_action, entry_price, stop_loss_price, pending_sell_quantity, boot_liquidation_pending
     try:
         data = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
-        log.warning("Malformed order_results payload skipped: %r | error: %s", raw_payload, exc)
+        log.warning("Malformed execution confirmation skipped: %r | error: %s", raw_payload, exc)
         return
 
     side = str(data.get("side", "")).upper()
+    if side == "":
+        side = str(data.get("action", "")).upper()
     result = str(data.get("result", "")).upper()
+    reason = str(data.get("reason", "")).upper()
 
     if side not in {"BUY", "SELL"}:
         return
 
     if boot_liquidation_pending and side == "SELL":
+        startup_reason = reason in {
+            "SYSTEM_REBOOT_LIQUIDATION",
+            "STARTUP_BALANCE_SYNC",
+            "STARTUP_BALANCE_SYNC_CLEAR",
+        }
+        if not startup_reason:
+            return
+
+        if result != "SUCCESS":
+            log.warning("Startup liquidation confirmation not successful: result=%s", result)
+            return
+
         boot_liquidation_pending = False
         pending_action = None
         pending_sell_quantity = "0.0000"
@@ -370,13 +393,19 @@ def handle_sentiment_update(raw_payload: str) -> None:
 
 async def consume_stream(redis_client: aioredis.Redis) -> None:
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-    await pubsub.subscribe(MARKET_DATA_CHANNEL, SENTIMENT_CHANNEL, ORDER_RESULTS_CHANNEL)
-
-    log.info(
-        "Strategy engine listening on channels: %s, %s, %s",
+    await pubsub.subscribe(
         MARKET_DATA_CHANNEL,
         SENTIMENT_CHANNEL,
         ORDER_RESULTS_CHANNEL,
+        EXECUTION_CONFIRMATIONS_CHANNEL,
+    )
+
+    log.info(
+        "Strategy engine listening on channels: %s, %s, %s, %s",
+        MARKET_DATA_CHANNEL,
+        SENTIMENT_CHANNEL,
+        ORDER_RESULTS_CHANNEL,
+        EXECUTION_CONFIRMATIONS_CHANNEL,
     )
 
     try:
@@ -400,6 +429,10 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
                 handle_order_result_update(payload)
                 continue
 
+            if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
+                handle_execution_confirmation(payload)
+                continue
+
             if channel != MARKET_DATA_CHANNEL:
                 continue
 
@@ -414,7 +447,12 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
 
             await evaluate_market_tick(price, symbol, timestamp, redis_client)
     finally:
-        await pubsub.unsubscribe(MARKET_DATA_CHANNEL, SENTIMENT_CHANNEL, ORDER_RESULTS_CHANNEL)
+        await pubsub.unsubscribe(
+            MARKET_DATA_CHANNEL,
+            SENTIMENT_CHANNEL,
+            ORDER_RESULTS_CHANNEL,
+            EXECUTION_CONFIRMATIONS_CHANNEL,
+        )
         await pubsub.aclose()
 
 

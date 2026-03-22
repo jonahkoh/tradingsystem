@@ -55,7 +55,7 @@ XRP_SENTIMENT_CHANNEL           = "sentiment_signals_xrp"
 TRADE_SIGNALS_CHANNEL           = "trade_signals"
 EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 
-TRADE_SYMBOL       = os.getenv("TRADE_SYMBOL", "XRP/USD")
+TRADE_SYMBOL       = "XRP/USD"
 DEFAULT_ORDER_TYPE = "MARKET"
 
 # ATR parameters

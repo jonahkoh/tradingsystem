@@ -52,7 +52,7 @@ SENTIMENT_CHANNEL               = "sentiment_signals"
 TRADE_SIGNALS_CHANNEL           = "trade_signals"
 EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 
-TRADE_SYMBOL       = os.getenv("TRADE_SYMBOL", "FET/USD")
+TRADE_SYMBOL       = "FET/USD"
 DEFAULT_ORDER_TYPE = "MARKET"
 
 # ATR parameters
@@ -481,9 +481,13 @@ def handle_sentiment_update(raw_payload: str) -> None:
 
     try:
         data  = json.loads(raw_payload)
+        coin  = str(data.get("coin", "GLOBAL")).upper()
         score = float(data.get("compound_score", 0.0))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         log.warning("Malformed sentiment payload skipped: %r | %s", raw_payload, exc)
+        return
+
+    if coin not in {"GLOBAL", "FET"}:
         return
 
     prev           = sentiment_score

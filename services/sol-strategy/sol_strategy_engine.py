@@ -56,7 +56,7 @@ SENTIMENT_CHANNEL               = "sentiment_signals"
 TRADE_SIGNALS_CHANNEL           = "trade_signals"
 EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 
-TRADE_SYMBOL       = os.getenv("TRADE_SYMBOL", "SOL/USD")
+TRADE_SYMBOL       = "SOL/USD"
 DEFAULT_ORDER_TYPE = "MARKET"
 
 # EMA periods.
@@ -70,9 +70,17 @@ ATR_PERIOD      = int(os.getenv("SOL_ATR_PERIOD",      "14"))
 ATR_STOPLOSS_K  = float(os.getenv("SOL_ATR_STOPLOSS_K", "2.0"))
 FALLBACK_STOP   = float(os.getenv("SOL_FALLBACK_STOP_MULTIPLIER", "0.95"))  # 5% fixed fallback
 
-# Sentiment gate — only suppress entry in SEVERE_FEAR (-0.30 threshold).
-# SOL momentum works in UNEASE/NEUTRAL/HYPE; only extreme panic is dangerous.
+# Sentiment gate — hard floor; entry blocked below this regardless of spread.
 SENTIMENT_ENTRY_GATE = float(os.getenv("SOL_SENTIMENT_ENTRY_GATE", "-0.30"))
+
+# Sentiment-scaled minimum EMA spread (fast − slow) as a fraction of price.
+# In fearful regimes, demand a wider spread to confirm real momentum — prevents
+# entering on weak/noisy crossovers that immediately reverse.
+# Defaults: SEVERE_FEAR=0.40%, UNEASE=0.25%, NEUTRAL=0.15%, HYPE=0.05%
+SOL_SPREAD_SEVERE_FEAR = float(os.getenv("SOL_SPREAD_SEVERE_FEAR", "0.0040"))
+SOL_SPREAD_UNEASE      = float(os.getenv("SOL_SPREAD_UNEASE",      "0.0025"))
+SOL_SPREAD_NEUTRAL     = float(os.getenv("SOL_SPREAD_NEUTRAL",     "0.0015"))
+SOL_SPREAD_HYPE        = float(os.getenv("SOL_SPREAD_HYPE",        "0.0005"))
 
 # Portfolio sizing — SOL gets 20% of portfolio.
 PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",   "1000000"))
@@ -188,6 +196,24 @@ def _target_quantity(price: float) -> str:
         return "0"
     qty = int(math.floor(TARGET_ORDER_USD / price))
     return str(qty)
+
+
+def _required_ema_spread(sentiment: float) -> float:
+    """Return the minimum (fast_ema - slow_ema) / price needed to enter.
+
+    Maps sentiment score to a spread threshold:
+      SEVERE_FEAR (< -0.30) → 0.40% — demand strong conviction
+      UNEASE      (< -0.05) → 0.25%
+      NEUTRAL     (≤  0.25) → 0.15%
+      HYPE        (>  0.25) → 0.05% — momentum regime, lower bar
+    """
+    if sentiment < -0.30:
+        return SOL_SPREAD_SEVERE_FEAR
+    if sentiment < -0.05:
+        return SOL_SPREAD_UNEASE
+    if sentiment <= 0.25:
+        return SOL_SPREAD_NEUTRAL
+    return SOL_SPREAD_HYPE
 
 
 # ── State Persistence ──────────────────────────────────────────────────────────
@@ -334,12 +360,23 @@ async def evaluate_market_tick(
         log.info("Signal suppressed: awaiting startup liquidation.")
         return
 
-    # ── Entry: Golden Cross + Sentiment Gate ─────────────────────────────────
+    # ── Entry: Golden Cross + Sentiment-Scaled Spread Filter ─────────────────
+    min_spread_pct  = _required_ema_spread(global_sentiment_score)
+    actual_spread   = (fast_ema - slow_ema) / price if price > 0 else 0.0
+    spread_ok       = actual_spread >= min_spread_pct
+
+    if not spread_ok and golden_cross:
+        log.info(
+            "Golden cross suppressed (spread too narrow): spread=%.4f%% < required=%.4f%% | senti=%.4f",
+            actual_spread * 100, min_spread_pct * 100, global_sentiment_score,
+        )
+
     if (
         not in_position
         and now_ts > cooldown_until
         and golden_cross
         and global_sentiment_score > SENTIMENT_ENTRY_GATE
+        and spread_ok
     ):
         quantity             = _target_quantity(price)
         pending_action       = "BUY"
@@ -351,14 +388,14 @@ async def evaluate_market_tick(
             atr_at_entry = current_atr
             stop_price   = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
             log.info(
-                "Golden cross BUY: entry=%.6f ATR=%.6f stop=%.6f senti=%.4f",
-                entry_price, atr_at_entry, stop_price, global_sentiment_score,
+                "Golden cross BUY: entry=%.6f ATR=%.6f stop=%.6f spread=%.4f%% senti=%.4f",
+                entry_price, atr_at_entry, stop_price, actual_spread * 100, global_sentiment_score,
             )
         else:
             atr_at_entry = 0.0
             log.info(
-                "Golden cross BUY: entry=%.6f (ATR not seeded, fallback stop %.0f%%)",
-                entry_price, (1.0 - FALLBACK_STOP) * 100,
+                "Golden cross BUY: entry=%.6f (ATR not seeded, fallback stop %.0f%%) spread=%.4f%% senti=%.4f",
+                entry_price, (1.0 - FALLBACK_STOP) * 100, actual_spread * 100, global_sentiment_score,
             )
 
         await _publish_signal(
@@ -366,7 +403,7 @@ async def evaluate_market_tick(
             action="BUY",
             symbol=symbol,
             quantity=quantity,
-            reason=f"Golden_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}_senti={global_sentiment_score:.3f}",
+            reason=f"Golden_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}_spread={actual_spread*100:.3f}pct_senti={global_sentiment_score:.3f}",
             timestamp=timestamp,
             expected_price=price,
         )

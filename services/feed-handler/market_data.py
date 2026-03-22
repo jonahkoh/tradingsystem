@@ -31,6 +31,7 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 ROOSTOO_BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com").rstrip("/")
 PAIR = os.getenv("TRADE_SYMBOL", "BTC/USD")
+PAIRS_ENV = os.getenv("TRADE_SYMBOLS", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 MARKET_CHANNEL = "market_data"
@@ -51,6 +52,14 @@ def _normalize_pair(raw_pair: str) -> str:
     if pair.endswith("USDT") and len(pair) > 4:
         return f"{pair[:-4]}/USD"
     return pair
+
+
+def _pairs_to_poll() -> list[str]:
+    if PAIRS_ENV.strip():
+        parsed = [_normalize_pair(p) for p in PAIRS_ENV.split(",") if p.strip()]
+        if parsed:
+            return parsed
+    return [_normalize_pair(PAIR)]
 
 
 def _sorted_params(params: dict[str, Any]) -> str:
@@ -99,33 +108,34 @@ def _fetch_top_of_book(client: httpx.Client, base_url: str, pair: str) -> tuple[
 
 
 def run() -> None:
-    pair = _normalize_pair(PAIR)
+    pairs = _pairs_to_poll()
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
     print(
-        f"[Market Data] Starting Roostoo poller | pair={pair} "
+        f"[Market Data] Starting Roostoo poller | pairs={pairs} "
         f"| base={ROOSTOO_BASE_URL} | poll={POLL_INTERVAL_SEC}s"
     )
 
     with httpx.Client(timeout=REQUEST_TIMEOUT_SEC) as client:
         while True:
             cycle_start = time.time()
-            try:
-                max_bid, min_ask, server_time_ms = _fetch_top_of_book(client, ROOSTOO_BASE_URL, pair)
-                mid_price = round((max_bid + min_ask) / 2.0, 6)
+            for pair in pairs:
+                try:
+                    max_bid, min_ask, server_time_ms = _fetch_top_of_book(client, ROOSTOO_BASE_URL, pair)
+                    mid_price = round((max_bid + min_ask) / 2.0, 6)
 
-                payload = {
-                    "symbol": pair,
-                    "mid_price": mid_price,
-                    # Keep integer seconds to preserve current strategy contract.
-                    "timestamp": int(server_time_ms / 1000),
-                }
+                    payload = {
+                        "symbol": pair,
+                        "mid_price": mid_price,
+                        # Keep integer seconds to preserve current strategy contract.
+                        "timestamp": int(server_time_ms / 1000),
+                    }
 
-                r.publish(MARKET_CHANNEL, json.dumps(payload))
-                print(f"[Market Data] Published: {payload}")
+                    r.publish(MARKET_CHANNEL, json.dumps(payload))
+                    print(f"[Market Data] Published: {payload}")
 
-            except Exception as exc:
-                print(f"[Market Data] Poll failed: {exc}")
+                except Exception as exc:
+                    print(f"[Market Data] Poll failed for {pair}: {exc}")
 
             if RUN_ONCE:
                 print("[Market Data] RUN_ONCE=true, exiting after one polling cycle.")

@@ -62,6 +62,9 @@ DEFAULT_ORDER_TYPE = "MARKET"
 ATR_PERIOD       = int(os.getenv("XRP_ATR_PERIOD",       "14"))
 ATR_BREAKOUT_K   = float(os.getenv("XRP_ATR_BREAKOUT_K", "2.0"))  # entry: spike > 2× ATR
 ATR_STOPLOSS_K   = float(os.getenv("XRP_ATR_STOPLOSS_K", "1.5"))  # exit: drop > 1.5× ATR from entry
+# Minimum ATR in USD — prevents triggering on micro-noise when price is flat during warmup.
+# At XRP ~$1.40, 0.003 ≈ 0.2% move — a meaningful minimum before calling it a "breakout".
+ATR_MIN_USD      = float(os.getenv("XRP_ATR_MIN_USD",    "0.003"))
 
 # Take-profit and sentiment gates
 TAKE_PROFIT_MULT    = float(os.getenv("XRP_TAKE_PROFIT_MULT",    "1.08"))   # 8% take-profit
@@ -154,11 +157,14 @@ def _compute_atr_update(true_range: float) -> float | None:
 
 
 def _target_quantity(price: float) -> str:
-    """Floor-divide target notional by price to get order quantity (4dp)."""
+    """Floor-divide target notional by price to get whole-unit order quantity.
+
+    Roostoo requires integer step sizes for XRP — no fractional units.
+    """
     if price <= 0:
-        return "0.0000"
-    qty = math.floor((TARGET_ORDER_USD / price) * 10_000) / 10_000
-    return f"{qty:.4f}"
+        return "0"
+    qty = int(math.floor(TARGET_ORDER_USD / price))
+    return str(qty)
 
 
 # ── Signal Publishing ──────────────────────────────────────────────────────────
@@ -235,6 +241,14 @@ async def evaluate_market_tick(
         price, delta, current_atr, (abs(delta) / current_atr if current_atr > 0 else 0),
         xrp_sentiment_score, state, cooldown_remaining,
     )
+
+    # ── ATR floor: ignore signals until ATR reflects real volatility ────────
+    if current_atr < ATR_MIN_USD:
+        log.info(
+            "ATR too small (%.6f < min=%.6f) — waiting for real volatility.",
+            current_atr, ATR_MIN_USD,
+        )
+        return
 
     # ── Suppress while awaiting fill or startup liquidation ─────────────────
     if pending_action is not None:
@@ -371,10 +385,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         }:
             return
 
-        if result != "SUCCESS":
-            log.warning("Startup liquidation not successful: result=%s", result)
-            return
-
+        # Clear regardless of result — a failed liquidation means nothing was held (already clean).
         boot_liquidation_pending = False
         pending_action           = None
         pending_sell_quantity    = "0.0000"
@@ -382,7 +393,10 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         open_position_quantity   = "0.0000"
         entry_price              = 0.0
         atr_at_entry             = 0.0
-        log.info("Startup liquidation completed for %s: result=%s", TRADE_SYMBOL, result)
+        if result == "SUCCESS":
+            log.info("Startup liquidation completed for %s.", TRADE_SYMBOL)
+        else:
+            log.info("Startup liquidation skipped for %s (nothing held): result=%s", TRADE_SYMBOL, result)
         return
 
     # ── Normal fill acknowledgment ───────────────────────────────────────────
@@ -417,10 +431,11 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         executed_qty = 0.0
 
     if side == "BUY":
-        net_qty                = max(executed_qty * (1.0 - TRADING_FEE_RATE), 0.0)
+        # Floor to whole units — Roostoo requires integer step sizes for XRP.
+        net_qty                = int(math.floor(executed_qty * (1.0 - TRADING_FEE_RATE)))
         in_position            = net_qty > 0
-        open_position_quantity = f"{net_qty:.4f}"
-        pending_sell_quantity  = "0.0000"
+        open_position_quantity = str(net_qty)
+        pending_sell_quantity  = "0"
         pending_action         = None
         log.info(
             "BUY confirmed: executed=%.8f fee_rate=%.4f net_qty=%s entry=%.6f atr=%.6f",
@@ -600,6 +615,8 @@ async def run() -> None:
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
             if not boot_liquidation_done:
+                # Wait for execution manager to subscribe to trade_signals.
+                await asyncio.sleep(8)
                 await initialize_clean_slate(redis_client)
                 boot_liquidation_done = True
 

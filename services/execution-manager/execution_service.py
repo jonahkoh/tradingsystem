@@ -464,6 +464,12 @@ def execute_trade_signal(
                 ),
             )
             redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
+            # Always publish a confirmation so strategy engines can clear pending_action.
+            _publish_execution_confirmation(
+                redis_client,
+                signal_payload=signal_payload,
+                result_payload=result,
+            )
             return result
 
     effective_qty = _floor_to_decimals(effective_qty, 8)

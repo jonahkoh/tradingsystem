@@ -511,10 +511,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         if not startup_reason:
             return
 
-        if result != "SUCCESS":
-            log.warning("Startup liquidation confirmation not successful: result=%s", result)
-            return
-
+        # Clear regardless of result — a failed liquidation means nothing was held (already clean).
         boot_liquidation_pending = False
         pending_action           = None
         pending_sell_quantity    = "0.0000"
@@ -523,7 +520,10 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         entry_price              = 0.0
         stop_loss_price          = 0.0
         half_position_sold       = False
-        log.info("Startup liquidation completed: result=%s", result)
+        if result == "SUCCESS":
+            log.info("Startup liquidation completed.")
+        else:
+            log.info("Startup liquidation skipped (nothing held): result=%s", result)
         return
 
     if pending_action is None:
@@ -744,6 +744,8 @@ async def run() -> None:
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
             if not boot_liquidation_done:
+                # Wait for execution manager to subscribe to trade_signals.
+                await asyncio.sleep(8)
                 await initialize_clean_slate(redis_client)
                 boot_liquidation_done = True
 

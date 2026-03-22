@@ -1,0 +1,725 @@
+"""Process — PAXG Strategy Engine (Bollinger Band Mean Reversion).
+
+PAXG (Pax Gold) tracks the gold spot price — a slow, mean-reverting asset.
+Uses the same Bollinger Band logic as the BTC strategy but with wider stops
+and a shorter window to stay responsive to gold's lower-volatility oscillations.
+
+Subscribes to:
+    market_data               — mid_price ticks (filtered to PAXG/USD)
+    sentiment_signals         — NLP compound score (used as size scalar)
+    execution_confirmations
+
+Publishes trade signals to trade_signals.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import time
+from collections import deque
+from typing import Any
+
+import redis.asyncio as aioredis
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+MARKET_DATA_CHANNEL             = "market_data"
+SENTIMENT_CHANNEL               = "sentiment_signals"
+TRADE_SIGNALS_CHANNEL           = "trade_signals"
+ORDER_RESULTS_CHANNEL           = "order_results"
+EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
+
+DEFAULT_SYMBOL     = os.getenv("TRADE_SYMBOL", "PAXG/USD")
+DEFAULT_ORDER_TYPE = "MARKET"
+
+# Bollinger Band window.
+# Gold is slow — 60 × 5s = 5 min rolling window keeps us reactive to price drops.
+WINDOW_PERIOD = int(os.getenv("PAXG_WINDOW_PERIOD", "60"))
+
+# Trend filter: only BUY when price > long-term SMA (avoids downtrending gold).
+TREND_FILTER_PERIOD = int(os.getenv("PAXG_TREND_FILTER_PERIOD", "240"))
+
+# ATR stop-loss — wider than BTC since gold volatility is very low.
+ATR_PERIOD      = int(os.getenv("PAXG_ATR_PERIOD",      "14"))
+ATR_STOPLOSS_K  = float(os.getenv("PAXG_ATR_STOPLOSS_K", "2.0"))
+FALLBACK_STOP_LOSS = float(os.getenv("PAXG_FALLBACK_STOP_MULTIPLIER", "0.98"))
+
+# Partial exits: 50% at SMA, 50% at upper Bollinger Band.
+PARTIAL_EXITS_ENABLED = os.getenv("PAXG_PARTIAL_EXITS_ENABLED", "true").lower() == "true"
+
+# Portfolio sizing: PAXG gets a fixed allocation of total portfolio.
+PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",    "1000000"))
+PAXG_ALLOCATION  = float(os.getenv("PAXG_ALLOCATION",  "0.10"))
+TARGET_ORDER_USD = PORTFOLIO_USD * PAXG_ALLOCATION
+
+# Dynamic sizing scalars.
+VOLATILITY_SENSITIVITY = float(os.getenv("PAXG_VOLATILITY_SENSITIVITY", "10.0"))
+MIN_POSITION_SCALAR    = float(os.getenv("PAXG_MIN_POSITION_SCALAR",    "0.4"))
+
+POLL_TIMEOUT_SEC    = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
+RETRY_DELAY_SEC     = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
+TRADING_FEE_RATE    = float(os.getenv("TRADING_FEE_RATE",          "0.001"))
+MIN_SELL_MULTIPLIER = float(os.getenv("MIN_SELL_MULTIPLIER",       "1.0025"))
+COOLDOWN_SECONDS    = int(os.getenv("PAXG_STOP_LOSS_COOLDOWN_SEC", "1800"))
+
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [PAXG-Strategy] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger(__name__)
+
+
+# ── Sentiment Profiles ─────────────────────────────────────────────────────────
+# Gold is a safe-haven — in SEVERE_FEAR, gold tends to rally; in HYPE, it dips.
+# We keep the same profile structure but use it as a size scalar only.
+SEVERE_FEAR_PROFILE = {"label": "SEVERE_FEAR", "multiplier": 2.95, "reason": "2.95_SD_Panic_Dip"}
+UNEASE_PROFILE      = {"label": "UNEASE",      "multiplier": 2.45, "reason": "2.45_SD_Unease_Dip"}
+NEUTRAL_PROFILE     = {"label": "NEUTRAL",     "multiplier": 1.95, "reason": "1.95_SD_Neutral_Dip"}
+HYPE_PROFILE        = {"label": "HYPE",        "multiplier": 1.45, "reason": "1.45_SD_Hype_Dip"}
+
+_SENTIMENT_SIZE_SCALARS: dict[str, float] = {
+    "SEVERE_FEAR": 1.25,   # gold rallies in panic — buy larger
+    "UNEASE":      1.10,
+    "NEUTRAL":     1.00,
+    "HYPE":        0.80,   # gold weakens in risk-on — smaller size
+}
+
+
+# ── Strategy State ─────────────────────────────────────────────────────────────
+prices: deque[float]      = deque(maxlen=WINDOW_PERIOD)
+trend_prices: deque[float] = deque(maxlen=TREND_FILTER_PERIOD)
+
+atr_true_ranges: deque[float] = deque(maxlen=ATR_PERIOD)
+atr_value: float       = 0.0
+atr_initialized: bool  = False
+last_atr_price: float | None = None
+
+latest_sentiment_score: float = 0.0
+
+in_position: bool              = False
+open_position_quantity: str    = "0.0000"
+entry_price: float             = 0.0
+stop_loss_price: float         = 0.0
+half_position_sold: bool       = False
+
+pending_action: str | None     = None
+pending_sell_quantity: str     = "0.0000"
+cooldown_until: float          = 0.0
+
+boot_liquidation_done: bool    = False
+boot_liquidation_pending: bool = False
+
+
+# ── Shutdown Handler ───────────────────────────────────────────────────────────
+def _handle_shutdown(signum: int, frame: Any) -> None:
+    log.info("Shutdown signal received. Exiting PAXG strategy engine.")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT,  _handle_shutdown)
+signal.signal(signal.SIGTERM, _handle_shutdown)
+
+
+# ── Math Helpers ───────────────────────────────────────────────────────────────
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _std(values: list[float], mean_val: float) -> float:
+    variance = sum((v - mean_val) ** 2 for v in values) / len(values)
+    return math.sqrt(variance)
+
+
+# ── ATR (Wilder's Smoothing) ───────────────────────────────────────────────────
+def _compute_atr(current_price: float) -> float | None:
+    global atr_value, atr_initialized, last_atr_price
+
+    if last_atr_price is None:
+        last_atr_price = current_price
+        return None
+
+    tr = abs(current_price - last_atr_price)
+    last_atr_price = current_price
+    atr_true_ranges.append(tr)
+
+    if not atr_initialized:
+        if len(atr_true_ranges) < ATR_PERIOD:
+            return None
+        atr_value = sum(atr_true_ranges) / ATR_PERIOD
+        atr_initialized = True
+        log.info("ATR(%d) seeded at %.6f.", ATR_PERIOD, atr_value)
+        return atr_value
+
+    atr_value = (atr_value * (ATR_PERIOD - 1) + tr) / ATR_PERIOD
+    return atr_value
+
+
+# ── Sentiment / Sizing Helpers ─────────────────────────────────────────────────
+def resolve_sd_profile(compound_score: float) -> dict[str, float | str]:
+    if compound_score < -0.30:
+        return SEVERE_FEAR_PROFILE
+    if compound_score < -0.05:
+        return UNEASE_PROFILE
+    if compound_score <= 0.25:
+        return NEUTRAL_PROFILE
+    return HYPE_PROFILE
+
+
+def _dynamic_target_notional(sma: float, std: float, profile_label: str) -> float:
+    norm_vol   = (std / sma) if sma > 0 else 0.0
+    vol_scalar = max(MIN_POSITION_SCALAR, 1.0 / (1.0 + VOLATILITY_SENSITIVITY * norm_vol))
+    senti_scalar = _SENTIMENT_SIZE_SCALARS.get(profile_label, 1.0)
+    return TARGET_ORDER_USD * vol_scalar * senti_scalar
+
+
+def _quantity_from_notional(price: float, notional: float) -> str:
+    if price <= 0 or notional <= 0:
+        return "0.0000"
+    qty = math.floor((notional / price) * 10_000) / 10_000
+    return f"{qty:.4f}"
+
+
+def compute_bollinger_inputs(latest_prices: list[float]) -> tuple[float, float]:
+    sma = _mean(latest_prices)
+    std = _std(latest_prices, sma)
+    return sma, std
+
+
+# ── Signal Publishing ──────────────────────────────────────────────────────────
+async def publish_signal(
+    redis_client: aioredis.Redis,
+    *,
+    action: str,
+    symbol: str,
+    quantity: str,
+    reason: str,
+    timestamp: int,
+    expected_price: float,
+) -> None:
+    payload: dict[str, Any] = {
+        "action":         action,
+        "symbol":         symbol,
+        "type":           DEFAULT_ORDER_TYPE,
+        "quantity":       quantity,
+        "reason":         reason,
+        "timestamp":      timestamp,
+        "expected_price": expected_price,
+    }
+    try:
+        await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
+        log.info("Signal published → %s", payload)
+    except aioredis.RedisError as exc:
+        log.error("Failed to publish trade signal: %s", exc)
+        raise
+
+
+# ── Market Tick Evaluation ─────────────────────────────────────────────────────
+async def evaluate_market_tick(
+    price: float,
+    symbol: str,
+    timestamp: int,
+    redis_client: aioredis.Redis,
+) -> None:
+    global pending_action, in_position, open_position_quantity, entry_price
+    global stop_loss_price, cooldown_until, pending_sell_quantity
+    global boot_liquidation_pending, half_position_sold
+
+    if symbol != DEFAULT_SYMBOL:
+        return
+
+    current_atr = _compute_atr(price)
+
+    prices.append(price)
+    if len(prices) < WINDOW_PERIOD:
+        log.info("Warming Bollinger window: %d/%d prices.", len(prices), WINDOW_PERIOD)
+        return
+
+    trend_prices.append(price)
+    trend_sma: float | None = (
+        _mean(list(trend_prices)) if len(trend_prices) >= TREND_FILTER_PERIOD else None
+    )
+
+    sma, std = compute_bollinger_inputs(list(prices))
+    profile       = resolve_sd_profile(latest_sentiment_score)
+    dynamic_lower = sma - (float(profile["multiplier"]) * std)
+    upper_band    = sma + (float(profile["multiplier"]) * std)
+
+    dyn_notional = _dynamic_target_notional(sma, std, str(profile["label"]))
+    quantity     = _quantity_from_notional(price, dyn_notional)
+
+    state = "IN_POSITION" if in_position else "OUT_OF_POSITION"
+    trend_tag = f"trend_sma={trend_sma:.2f}" if trend_sma is not None else "trend=seeding"
+    log.info(
+        "px=%.6f | SMA=%.6f | SD=%.6f | lower=%.6f | upper=%.6f | "
+        "ATR=%.6f | senti=%.4f (%s) | notional=$%.0f | %s | %s",
+        price, sma, std, dynamic_lower, upper_band,
+        current_atr if current_atr else 0.0,
+        latest_sentiment_score, profile["label"],
+        dyn_notional, trend_tag, state,
+    )
+
+    if pending_action is not None:
+        log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
+        return
+
+    if boot_liquidation_pending:
+        log.info("Signal suppressed: awaiting startup liquidation.")
+        return
+
+    now_ts = time.time()
+
+    if cooldown_until > now_ts and price > sma:
+        cooldown_until = 0.0
+        log.info("Market recovered above SMA — cooldown cancelled early.")
+
+    # ── Entry: BUY ────────────────────────────────────────────────────────────
+    if not in_position and now_ts > cooldown_until and price < dynamic_lower:
+        if trend_sma is not None and price <= trend_sma:
+            log.info(
+                "BUY suppressed by trend filter: px=%.6f <= trend_sma=%.6f (downtrend).",
+                price, trend_sma,
+            )
+            return
+
+        pending_action = "BUY"
+        entry_price    = price
+
+        if current_atr and current_atr > 0:
+            stop_loss_price = entry_price - (ATR_STOPLOSS_K * current_atr)
+            log.info(
+                "Stop-loss set: entry=%.6f ATR=%.6f k=%.2f stop=%.6f",
+                entry_price, current_atr, ATR_STOPLOSS_K, stop_loss_price,
+            )
+        else:
+            stop_loss_price = entry_price * FALLBACK_STOP_LOSS
+            log.info(
+                "ATR not seeded — using fallback stop-loss %.4f → stop=%.6f",
+                FALLBACK_STOP_LOSS, stop_loss_price,
+            )
+
+        await publish_signal(
+            redis_client,
+            action="BUY",
+            symbol=symbol,
+            quantity=quantity,
+            reason=str(profile["reason"]),
+            timestamp=timestamp,
+            expected_price=price,
+        )
+        return
+
+    if not in_position:
+        return
+
+    # ── Stop-Loss ─────────────────────────────────────────────────────────────
+    if price <= stop_loss_price:
+        sell_qty              = open_position_quantity
+        pending_action        = "SELL"
+        pending_sell_quantity = sell_qty
+        cooldown_until        = now_ts + COOLDOWN_SECONDS
+        await publish_signal(
+            redis_client,
+            action="SELL",
+            symbol=symbol,
+            quantity=sell_qty,
+            reason="ATR_StopLoss",
+            timestamp=timestamp,
+            expected_price=price,
+        )
+        log.warning(
+            "ATR stop-loss triggered: px=%.6f stop=%.6f entry=%.6f",
+            price, stop_loss_price, entry_price,
+        )
+        return
+
+    # ── Take-Profit (partial or full) ─────────────────────────────────────────
+    minimum_sell_price = entry_price * MIN_SELL_MULTIPLIER
+
+    if PARTIAL_EXITS_ENABLED:
+        if not half_position_sold and price >= sma and price >= minimum_sell_price:
+            total_qty = float(open_position_quantity)
+            half_qty  = math.floor(total_qty / 2 * 10_000) / 10_000
+
+            if half_qty > 0:
+                pending_action        = "SELL"
+                pending_sell_quantity = f"{half_qty:.4f}"
+                await publish_signal(
+                    redis_client,
+                    action="SELL",
+                    symbol=symbol,
+                    quantity=f"{half_qty:.4f}",
+                    reason="Partial_Exit_50pct_SMA",
+                    timestamp=timestamp,
+                    expected_price=price,
+                )
+                return
+            else:
+                log.warning(
+                    "Half qty rounds to zero (total=%.8f) — partial exit skipped.", total_qty,
+                )
+
+        if half_position_sold and price >= upper_band:
+            sell_qty              = open_position_quantity
+            pending_action        = "SELL"
+            pending_sell_quantity = sell_qty
+            await publish_signal(
+                redis_client,
+                action="SELL",
+                symbol=symbol,
+                quantity=sell_qty,
+                reason="Partial_Exit_50pct_Upper_Band",
+                timestamp=timestamp,
+                expected_price=price,
+            )
+            return
+
+    else:
+        if price >= sma and price >= minimum_sell_price:
+            sell_qty              = open_position_quantity
+            pending_action        = "SELL"
+            pending_sell_quantity = sell_qty
+            await publish_signal(
+                redis_client,
+                action="SELL",
+                symbol=symbol,
+                quantity=sell_qty,
+                reason="Mean_Reversion_TP",
+                timestamp=timestamp,
+                expected_price=price,
+            )
+            return
+
+        if price >= sma:
+            log.info("Holding position: SMA reached but 0.25%% fee spread not met.")
+
+
+# ── Execution Confirmation Handler ─────────────────────────────────────────────
+def _extract_executed_quantity(order_result: dict[str, Any]) -> float:
+    order_details = order_result.get("order_details")
+    if isinstance(order_details, dict):
+        for key in ("FilledQuantity", "Quantity"):
+            value = order_details.get(key)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+
+    for key in ("effective_qty", "qty"):
+        value = order_result.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+
+    return 0.0
+
+
+def handle_order_result_update(raw_payload: str) -> None:
+    _ = raw_payload
+    return
+
+
+def handle_execution_confirmation(raw_payload: str) -> None:
+    global in_position, open_position_quantity, pending_action, entry_price
+    global stop_loss_price, pending_sell_quantity, boot_liquidation_pending
+    global half_position_sold
+
+    try:
+        data = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        log.warning("Malformed execution confirmation skipped: %r | error: %s", raw_payload, exc)
+        return
+
+    side   = str(data.get("side", "")).upper()
+    if side == "":
+        side = str(data.get("action", "")).upper()
+    result = str(data.get("result", "")).upper()
+    reason = str(data.get("reason", "")).upper()
+
+    if side not in {"BUY", "SELL"}:
+        return
+
+    # ── Startup Liquidation Acknowledgment ───────────────────────────────────
+    if boot_liquidation_pending and side == "SELL":
+        startup_reason = reason in {
+            "SYSTEM_REBOOT_LIQUIDATION",
+            "STARTUP_BALANCE_SYNC",
+            "STARTUP_BALANCE_SYNC_CLEAR",
+        }
+        if not startup_reason:
+            return
+
+        # Clear regardless of result — failed liquidation means nothing was held.
+        boot_liquidation_pending = False
+        pending_action           = None
+        pending_sell_quantity    = "0.0000"
+        in_position              = False
+        open_position_quantity   = "0.0000"
+        entry_price              = 0.0
+        stop_loss_price          = 0.0
+        half_position_sold       = False
+        if result == "SUCCESS":
+            log.info("Startup liquidation completed for %s.", DEFAULT_SYMBOL)
+        else:
+            log.info("Startup liquidation skipped for %s (nothing held): result=%s", DEFAULT_SYMBOL, result)
+        return
+
+    if pending_action is None:
+        return
+
+    if side != pending_action:
+        log.info(
+            "Ignoring out-of-order fill: side=%s while pending=%s", side, pending_action,
+        )
+        return
+
+    if result != "SUCCESS":
+        log.warning("%s fill failed (result=%s). Reverting pending state.", side, result)
+        if side == "BUY":
+            in_position            = False
+            open_position_quantity = "0.0000"
+            entry_price            = 0.0
+            stop_loss_price        = 0.0
+            half_position_sold     = False
+        elif side == "SELL":
+            in_position = True
+            if open_position_quantity in {"", "0", "0.0", "0.0000"}:
+                open_position_quantity = pending_sell_quantity
+        pending_sell_quantity = "0.0000"
+        pending_action        = None
+        return
+
+    executed_qty = _extract_executed_quantity(data)
+
+    if side == "BUY":
+        net_qty                = max(executed_qty * (1.0 - TRADING_FEE_RATE), 0.0)
+        in_position            = net_qty > 0
+        open_position_quantity = f"{net_qty:.4f}"
+        pending_sell_quantity  = "0.0000"
+        pending_action         = None
+        half_position_sold     = False
+        log.info(
+            "BUY confirmed: executed=%.8f fee_rate=%.4f net_qty=%s entry=%.6f stop=%.6f",
+            executed_qty, TRADING_FEE_RATE, open_position_quantity,
+            entry_price, stop_loss_price,
+        )
+        return
+
+    if side == "SELL":
+        try:
+            current_qty = float(open_position_quantity)
+        except ValueError:
+            current_qty = 0.0
+
+        remaining              = max(current_qty - executed_qty, 0.0)
+        in_position            = remaining > 0
+        open_position_quantity = f"{remaining:.4f}"
+        pending_sell_quantity  = "0.0000"
+
+        if remaining <= 0.0:
+            entry_price        = 0.0
+            stop_loss_price    = 0.0
+            half_position_sold = False
+        else:
+            half_position_sold = True
+
+        pending_action = None
+        log.info(
+            "SELL confirmed: executed=%.8f remaining_qty=%s half_sold=%s",
+            executed_qty, open_position_quantity, half_position_sold,
+        )
+
+
+def handle_sentiment_update(raw_payload: str) -> None:
+    global latest_sentiment_score
+
+    try:
+        data  = json.loads(raw_payload)
+        score = float(data.get("compound_score", 0.0))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("Malformed sentiment payload skipped: %r | error: %s", raw_payload, exc)
+        return
+
+    latest_sentiment_score = score
+    profile = resolve_sd_profile(latest_sentiment_score)
+    log.info(
+        "Sentiment updated: score=%.4f → profile=%s",
+        latest_sentiment_score, profile["label"],
+    )
+
+
+# ── Pub/Sub Consumer ───────────────────────────────────────────────────────────
+async def consume_stream(redis_client: aioredis.Redis) -> None:
+    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+    await pubsub.subscribe(
+        MARKET_DATA_CHANNEL,
+        SENTIMENT_CHANNEL,
+        ORDER_RESULTS_CHANNEL,
+        EXECUTION_CONFIRMATIONS_CHANNEL,
+    )
+    log.info(
+        "PAXG strategy subscribed to: %s, %s, %s, %s",
+        MARKET_DATA_CHANNEL, SENTIMENT_CHANNEL,
+        ORDER_RESULTS_CHANNEL, EXECUTION_CONFIRMATIONS_CHANNEL,
+    )
+
+    try:
+        while True:
+            try:
+                message = await pubsub.get_message(timeout=POLL_TIMEOUT_SEC)
+            except aioredis.RedisError as exc:
+                log.error("pubsub.get_message error: %s", exc)
+                raise
+
+            if message is None:
+                continue
+            if message.get("type") != "message":
+                continue
+
+            channel  = str(message.get("channel", ""))
+            raw_data = message.get("data", "")
+            payload  = (
+                raw_data.decode("utf-8", errors="replace")
+                if isinstance(raw_data, bytes)
+                else str(raw_data)
+            )
+
+            if channel == SENTIMENT_CHANNEL:
+                handle_sentiment_update(payload)
+                continue
+
+            if channel == ORDER_RESULTS_CHANNEL:
+                handle_order_result_update(payload)
+                continue
+
+            if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
+                handle_execution_confirmation(payload)
+                continue
+
+            if channel != MARKET_DATA_CHANNEL:
+                continue
+
+            try:
+                tick      = json.loads(payload)
+                price     = float(tick["mid_price"])
+                timestamp = int(tick.get("timestamp", time.time()))
+                symbol    = str(tick.get("symbol", DEFAULT_SYMBOL))
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                log.warning("Malformed market_data payload skipped: %r | error: %s", payload, exc)
+                continue
+
+            await evaluate_market_tick(price, symbol, timestamp, redis_client)
+
+    finally:
+        await pubsub.unsubscribe(
+            MARKET_DATA_CHANNEL,
+            SENTIMENT_CHANNEL,
+            ORDER_RESULTS_CHANNEL,
+            EXECUTION_CONFIRMATIONS_CHANNEL,
+        )
+        await pubsub.aclose()
+
+
+# ── Startup Liquidation ────────────────────────────────────────────────────────
+async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
+    global in_position, open_position_quantity, pending_action, entry_price
+    global stop_loss_price, cooldown_until, pending_sell_quantity
+    global boot_liquidation_pending, half_position_sold
+
+    payload = {
+        "action":   "SELL",
+        "symbol":   DEFAULT_SYMBOL,
+        "type":     DEFAULT_ORDER_TYPE,
+        "quantity": "ALL",
+        "reason":   "SYSTEM_REBOOT_LIQUIDATION",
+    }
+    try:
+        await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
+    except aioredis.RedisError as exc:
+        log.error("Failed to publish startup liquidation signal: %s", exc)
+        raise
+
+    boot_liquidation_pending = True
+    in_position              = False
+    open_position_quantity   = "0.0000"
+    pending_action           = "SELL"
+    entry_price              = 0.0
+    stop_loss_price          = 0.0
+    cooldown_until           = 0.0
+    pending_sell_quantity    = "0.0000"
+    half_position_sold       = False
+    log.info("Startup clean-slate liquidation signal published for %s.", DEFAULT_SYMBOL)
+
+
+# ── Entry Point ────────────────────────────────────────────────────────────────
+async def run() -> None:
+    global boot_liquidation_done
+
+    log.info(
+        "PAXG strategy engine starting | symbol=%s | bollinger_window=%d (≈%.0fs) | "
+        "trend_filter=%d (≈%.0fs) | atr_period=%d | atr_stop_k=%.2f | "
+        "partial_exits=%s | target_notional=$%.2f",
+        DEFAULT_SYMBOL,
+        WINDOW_PERIOD,       WINDOW_PERIOD       * 5,
+        TREND_FILTER_PERIOD, TREND_FILTER_PERIOD * 5,
+        ATR_PERIOD, ATR_STOPLOSS_K,
+        PARTIAL_EXITS_ENABLED,
+        TARGET_ORDER_USD,
+    )
+
+    while True:
+        redis_client: aioredis.Redis | None = None
+        try:
+            redis_client = aioredis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+            await redis_client.ping()
+            log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
+
+            if not boot_liquidation_done:
+                # Wait for execution manager to subscribe to trade_signals.
+                await asyncio.sleep(8)
+                await initialize_clean_slate(redis_client)
+                boot_liquidation_done = True
+
+            await consume_stream(redis_client)
+
+        except aioredis.RedisError as exc:
+            log.error("Redis error: %s. Retrying in %ds.", exc, RETRY_DELAY_SEC)
+            await asyncio.sleep(RETRY_DELAY_SEC)
+        except Exception as exc:
+            log.error(
+                "Unexpected error in PAXG strategy run loop: %s. Retrying in %ds.",
+                exc, RETRY_DELAY_SEC,
+            )
+            await asyncio.sleep(RETRY_DELAY_SEC)
+        finally:
+            if redis_client is not None:
+                try:
+                    await redis_client.aclose()
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

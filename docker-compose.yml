@@ -173,6 +173,36 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Process A4 — Feed Handler (PAXG) ─────────────────────────────────────────
+  feed-handler-paxg:
+    build:
+      context: .
+      dockerfile: services/feed-handler/Dockerfile
+    container_name: tradingsystem_feed_handler_paxg
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: PAXG/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process I — PAXG Bollinger Band Mean Reversion Strategy ──────────────────
+  paxg-strategy-engine:
+    build:
+      context: .
+      dockerfile: services/paxg-strategy/Dockerfile
+    container_name: tradingsystem_paxg_strategy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: PAXG/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:
 

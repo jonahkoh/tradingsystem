@@ -8,159 +8,366 @@
   :root {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
     --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
-    --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+    --red: #f85149; --yellow: #d29922; --blue: #58a6ff; --purple: #bc8cff;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; background: var(--bg); color: var(--text); padding: 20px; font-size: 14px; }
+  body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; background: var(--bg); color: var(--text); padding: 16px; font-size: 13px; }
 
-  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 12px; }
-
-  .stat { font-size: 28px; font-weight: 700; }
-  .stat-sm { font-size: 16px; color: var(--muted); margin-top: 4px; }
-  .pos { color: var(--green); }
-  .neg { color: var(--red); }
-  .neutral { color: var(--muted); }
-
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-  .badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
-  .badge-red { background: rgba(248,81,73,0.15); color: var(--red); }
-  .badge-yellow { background: rgba(210,153,34,0.15); color: var(--yellow); }
-  .badge-blue { background: rgba(88,166,255,0.15); color: var(--blue); }
-  .badge-muted { background: rgba(139,148,158,0.15); color: var(--muted); }
-
-  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-  .header h1 { font-size: 20px; font-weight: 700; }
-  .header-right { display: flex; gap: 10px; align-items: center; }
+  /* ── Header ── */
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+  .header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+  .header-right { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .dot-green { background: var(--green); }
-  .dot-red { background: var(--red); }
-  .dot-yellow { background: var(--yellow); }
+  .dot-green { background: var(--green); box-shadow: 0 0 5px var(--green); }
+  .dot-red   { background: var(--red); }
+  .dot-yellow { background: var(--yellow); animation: pulse 1.5s infinite; }
+  button { font-family: inherit; font-size: 12px; padding: 6px 14px; border-radius: 5px; border: 1px solid var(--border); cursor: pointer; font-weight: 600; transition: opacity 0.15s; }
+  button:hover { opacity: 0.8; }
+  .btn-kill   { background: rgba(248,81,73,0.12); color: var(--red); border-color: rgba(248,81,73,0.4); }
+  .btn-resume { background: rgba(63,185,80,0.12); color: var(--green); border-color: rgba(63,185,80,0.4); }
 
-  button { font-family: inherit; font-size: 13px; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); cursor: pointer; font-weight: 600; transition: opacity 0.15s; }
-  button:hover { opacity: 0.85; }
-  .btn-kill { background: var(--red); color: #fff; border-color: var(--red); }
-  .btn-resume { background: var(--green); color: #fff; border-color: var(--green); }
+  /* ── PnL Summary ── */
+  .pnl-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px; }
+  @media (max-width: 700px) { .pnl-row { grid-template-columns: repeat(2, 1fr); } }
+  .pnl-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .pnl-card .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; }
+  .pnl-card .val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
-  .confirm-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; justify-content: center; align-items: center; }
-  .confirm-overlay.active { display: flex; }
-  .confirm-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 24px; max-width: 380px; text-align: center; }
-  .confirm-box h3 { margin-bottom: 12px; font-size: 16px; }
-  .confirm-box p { color: var(--muted); margin-bottom: 20px; font-size: 13px; }
-  .confirm-box .btn-row { display: flex; gap: 10px; justify-content: center; }
+  /* ── Sentiment Banner ── */
+  .senti-banner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  .senti-item { display: flex; align-items: center; gap: 8px; }
+  .senti-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .senti-bar-wrap { width: 80px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .senti-bar { height: 100%; border-radius: 2px; transition: width 0.4s, background 0.4s; width: 50%; background: var(--blue); }
+  .senti-headline { flex: 1; font-size: 11px; color: var(--muted); font-style: italic; min-width: 160px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+  /* ── Coin Grid ── */
+  .coin-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 12px; }
+  @media (max-width: 1100px) { .coin-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 680px)  { .coin-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .coin-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; transition: border-color 0.25s; }
+  .coin-card.in-pos { border-color: rgba(63,185,80,0.45); }
+  .coin-card.pending { border-color: rgba(210,153,34,0.45); }
+
+  .cc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+  .cc-name   { font-size: 15px; font-weight: 700; }
+  .cc-sub    { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .cc-price  { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; margin-bottom: 10px; }
+  .cc-rows   { display: flex; flex-direction: column; gap: 5px; }
+  .cc-row    { display: flex; justify-content: space-between; font-size: 11px; }
+  .cc-row-lbl { color: var(--muted); }
+  .cc-row-val { font-weight: 600; }
+  .cc-footer { font-size: 10px; color: var(--muted); margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+
+  /* ── Badges ── */
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.3px; }
+  .bg-green  { background: rgba(63,185,80,0.15);  color: var(--green); }
+  .bg-red    { background: rgba(248,81,73,0.15);   color: var(--red); }
+  .bg-yellow { background: rgba(210,153,34,0.15);  color: var(--yellow); }
+  .bg-blue   { background: rgba(88,166,255,0.15);  color: var(--blue); }
+  .bg-muted  { background: rgba(139,148,158,0.1);  color: var(--muted); }
+
+  /* ── Bottom Grid ── */
+  .bottom-grid { display: grid; grid-template-columns: 3fr 2fr; gap: 10px; }
+  @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card h2 { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 10px; }
+
+  /* ── Trades Table ── */
+  .trades-wrap { max-height: 320px; overflow-y: auto; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
   tr:last-child td { border-bottom: none; }
 
-  .wallet-row { display: flex; justify-content: space-between; padding: 6px 0; }
-  .wallet-row:not(:last-child) { border-bottom: 1px solid var(--border); }
-  .wallet-asset { font-weight: 600; }
-  .wallet-free { color: var(--green); }
-  .wallet-locked { color: var(--yellow); }
+  /* ── Event Log ── */
+  #eventLog { font-size: 11px; line-height: 1.9; max-height: 320px; overflow-y: auto; }
 
-  .sentiment-bar { height: 6px; border-radius: 3px; background: var(--border); margin-top: 8px; position: relative; overflow: hidden; }
-  .sentiment-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  /* ── Confirm dialog ── */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100; justify-content: center; align-items: center; }
+  .overlay.active { display: flex; }
+  .confirm-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 24px; max-width: 360px; text-align: center; }
+  .confirm-box h3 { margin-bottom: 10px; font-size: 15px; }
+  .confirm-box p  { color: var(--muted); margin-bottom: 18px; font-size: 12px; }
+  .btn-row { display: flex; gap: 10px; justify-content: center; }
 
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .loading { animation: pulse 1.5s infinite; }
+  /* ── Utilities ── */
+  .pos  { color: var(--green); }
+  .neg  { color: var(--red); }
+  .neu  { color: var(--muted); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .loading { animation: pulse 1.5s infinite; color: var(--muted); }
 </style>
 </head>
 <body>
 
+<!-- ── Header ─────────────────────────────────────────────────────────────── -->
 <div class="header">
   <h1>Trading Dashboard</h1>
   <div class="header-right">
     <span id="wsStatus"><span class="dot dot-yellow"></span> connecting</span>
-    <span style="color:var(--muted); font-size:12px" id="lastUpdate">--</span>
-    <button class="btn-kill" onclick="showConfirm('kill')">HALT</button>
+    <span class="neu" style="font-size:11px" id="lastUpdate">--</span>
+    <button class="btn-kill"   onclick="showConfirm('kill')">HALT</button>
     <button class="btn-resume" onclick="showConfirm('resume')">RESUME</button>
   </div>
 </div>
 
-<div class="grid">
-  <div class="card">
-    <h2>Market Price</h2>
-    <div class="stat" id="marketPrice">--</div>
-    <div class="stat-sm" id="marketSymbol">--</div>
+<!-- ── PnL Summary ─────────────────────────────────────────────────────────── -->
+<div class="pnl-row">
+  <div class="pnl-card">
+    <div class="lbl">Realized PnL</div>
+    <div class="val neu" id="realizedPnl">--</div>
   </div>
-  <div class="card">
-    <h2>Position</h2>
-    <div class="stat" id="posQty">--</div>
-    <div class="stat-sm" id="posEntry">--</div>
+  <div class="pnl-card">
+    <div class="lbl">Unrealized PnL</div>
+    <div class="val neu" id="unrealizedPnl">--</div>
   </div>
-  <div class="card">
-    <h2>Unrealised PNL</h2>
-    <div class="stat" id="unrealPnl">--</div>
-    <div class="stat-sm" id="posStopLoss">--</div>
+  <div class="pnl-card">
+    <div class="lbl">Total PnL</div>
+    <div class="val neu" id="totalPnl">--</div>
   </div>
-</div>
-
-<div class="grid">
-  <div class="card">
-    <h2>Sentiment</h2>
-    <div style="display:flex; align-items:center; gap:10px;">
-      <span class="badge badge-muted" id="sentimentBadge">--</span>
-      <span id="sentimentScore" style="font-size:16px; font-weight:600;">--</span>
-    </div>
-    <div class="sentiment-bar"><div class="sentiment-fill" id="sentimentFill"></div></div>
-    <div class="stat-sm" style="margin-top:8px;" id="sentimentHeadline">--</div>
-  </div>
-  <div class="card">
-    <h2>Strategy State</h2>
-    <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <span class="badge badge-muted" id="stratState">--</span>
-      <span class="badge badge-muted" id="stratPending">--</span>
-    </div>
-    <div class="stat-sm" style="margin-top:10px;" id="stratDetail">--</div>
-  </div>
-  <div class="card">
-    <h2>Wallet Balance</h2>
-    <div id="walletContainer" class="loading" style="font-size:13px;">Loading...</div>
+  <div class="pnl-card">
+    <div class="lbl">Win / Loss / BE</div>
+    <div class="val" id="winLoss" style="color:var(--muted)">--</div>
   </div>
 </div>
 
-<div class="grid-2">
-  <div class="card" style="max-height:400px; overflow-y:auto;">
+<!-- ── Sentiment Banner ───────────────────────────────────────────────────── -->
+<div class="senti-banner">
+  <div class="senti-item">
+    <span class="senti-lbl">Global</span>
+    <span class="badge bg-muted" id="gSentiBadge">--</span>
+    <span style="font-weight:600;font-size:12px" id="gSentiScore">--</span>
+    <div class="senti-bar-wrap"><div class="senti-bar" id="gSentiBar"></div></div>
+  </div>
+  <div class="senti-item">
+    <span class="senti-lbl">XRP</span>
+    <span class="badge bg-muted" id="xSentiBadge">--</span>
+    <span style="font-weight:600;font-size:12px" id="xSentiScore">--</span>
+    <div class="senti-bar-wrap"><div class="senti-bar" id="xSentiBar"></div></div>
+  </div>
+  <div class="senti-headline" id="latestHeadline">Waiting for sentiment data…</div>
+</div>
+
+<!-- ── Coin Cards ─────────────────────────────────────────────────────────── -->
+<div class="coin-grid" id="coinGrid"></div>
+
+<!-- ── Trades + Event Log ─────────────────────────────────────────────────── -->
+<div class="bottom-grid">
+  <div class="card">
     <h2>Recent Trades</h2>
-    <table>
-      <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th></tr></thead>
-      <tbody id="tradesBody"><tr><td colspan="5" class="loading" style="color:var(--muted)">Loading...</td></tr></tbody>
-    </table>
+    <div class="trades-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th></tr></thead>
+        <tbody id="tradesBody"><tr><td colspan="6" class="loading">Loading…</td></tr></tbody>
+      </table>
+    </div>
   </div>
-  <div class="card" style="max-height:400px; overflow-y:auto;">
-    <h2>Live Event Log</h2>
-    <div id="eventLog" style="font-size:12px; line-height:1.8;"><span style="color:var(--muted)">Waiting for events...</span></div>
+  <div class="card">
+    <h2>Live Events</h2>
+    <div id="eventLog"><span class="neu">Waiting for events…</span></div>
   </div>
 </div>
 
-<!-- Confirmation dialog -->
-<div class="confirm-overlay" id="confirmOverlay">
+<!-- ── Confirm Dialog ────────────────────────────────────────────────────── -->
+<div class="overlay" id="confirmOverlay">
   <div class="confirm-box">
     <h3 id="confirmTitle">Confirm</h3>
     <p id="confirmMsg">Are you sure?</p>
     <div class="btn-row">
-      <button style="background:var(--surface);" onclick="hideConfirm()">Cancel</button>
+      <button style="background:var(--bg)" onclick="hideConfirm()">Cancel</button>
       <button id="confirmBtn" class="btn-kill" onclick="executeAction()">Confirm</button>
     </div>
   </div>
 </div>
 
 <script>
-const API = window.location.origin;
+const API    = window.location.origin;
 const WS_URL = `ws://${window.location.host}/ws/stream`;
 
-let currentPrice = 0;
+// Per-coin config
+const COINS = [
+  { sym: 'BTC/USD', name: 'BTC', strategy: 'Bollinger Band', pxDec: 2, qtyDec: 6, entryLbl: 'Entry' },
+  { sym: 'ETH/USD', name: 'ETH', strategy: 'Bollinger Band', pxDec: 2, qtyDec: 4, entryLbl: 'Entry' },
+  { sym: 'SOL/USD', name: 'SOL', strategy: 'DCA Tranches',   pxDec: 2, qtyDec: 2, entryLbl: 'Avg Cost' },
+  { sym: 'XRP/USD', name: 'XRP', strategy: 'ATR Breakout',   pxDec: 4, qtyDec: 0, entryLbl: 'Entry' },
+  { sym: 'FET/USD', name: 'FET', strategy: 'ATR Breakout',   pxDec: 4, qtyDec: 0, entryLbl: 'Entry' },
+];
+
+const prices    = {};   // sym → number
+const positions = {};   // sym → API position object
+const events    = [];
+const MAX_EVENTS = 80;
+
 let pendingAction = null;
 let ws = null;
-const maxEvents = 80;
-const events = [];
 
-// --- Polling ---
+// ── Build coin card skeletons ─────────────────────────────────────────────────
+function buildCoinGrid() {
+  document.getElementById('coinGrid').innerHTML = COINS.map(c => `
+    <div class="coin-card" id="card-${c.name}">
+      <div class="cc-header">
+        <div>
+          <div class="cc-name">${c.name}<span class="cc-sub">/USD</span></div>
+        </div>
+        <span class="badge bg-muted" id="badge-${c.name}">--</span>
+      </div>
+      <div class="cc-price neu" id="price-${c.name}">--</div>
+      <div class="cc-rows">
+        <div class="cc-row">
+          <span class="cc-row-lbl">Qty</span>
+          <span class="cc-row-val neu" id="qty-${c.name}">--</span>
+        </div>
+        <div class="cc-row">
+          <span class="cc-row-lbl">${c.entryLbl}</span>
+          <span class="cc-row-val neu" id="entry-${c.name}">--</span>
+        </div>
+        <div class="cc-row">
+          <span class="cc-row-lbl">Unrl PnL</span>
+          <span class="cc-row-val neu" id="upnl-${c.name}">--</span>
+        </div>
+        <div class="cc-row" id="extra-${c.name}" style="display:none">
+          <span class="cc-row-lbl" id="extraLbl-${c.name}">--</span>
+          <span class="cc-row-val neu" id="extraVal-${c.name}">--</span>
+        </div>
+      </div>
+      <div class="cc-footer">
+        <span>${c.strategy}</span>
+        <span class="badge bg-muted" id="pending-${c.name}" style="display:none">PENDING</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── Update a single coin card ──────────────────────────────────────────────────
+function fmt(v, dec) {
+  if (v == null) return '--';
+  return v.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+
+function updateCard(sym, pos) {
+  const cfg = COINS.find(c => c.sym === sym);
+  if (!cfg) return;
+  const n = cfg.name;
+
+  const inPos   = pos.in_position;
+  const qty     = parseFloat(pos.quantity)    || 0;
+  const entry   = parseFloat(pos.entry_price) || 0;
+  const stop    = parseFloat(pos.stop_loss_price) || 0;
+  const atr     = parseFloat(pos.atr_at_entry)    || 0;
+  const tranch  = pos.tranche_count || 0;
+  const pending = pos.pending_action;
+  const px      = prices[sym];
+
+  // Card border
+  const card = document.getElementById(`card-${n}`);
+  if (card) {
+    card.className = `coin-card${inPos ? ' in-pos' : ''}${pending ? ' pending' : ''}`;
+  }
+
+  // Badge
+  const badge = document.getElementById(`badge-${n}`);
+  if (badge) {
+    badge.textContent = inPos ? 'IN' : 'OUT';
+    badge.className   = `badge ${inPos ? 'bg-green' : 'bg-muted'}`;
+  }
+
+  // Price
+  const priceEl = document.getElementById(`price-${n}`);
+  if (priceEl) {
+    priceEl.textContent = px != null ? `$${fmt(px, cfg.pxDec)}` : '--';
+    priceEl.className   = 'cc-price';
+  }
+
+  // Qty
+  const qtyEl = document.getElementById(`qty-${n}`);
+  if (qtyEl) {
+    qtyEl.textContent = inPos && qty > 0
+      ? `${fmt(qty, cfg.qtyDec)} ${n}`
+      : '--';
+  }
+
+  // Entry / Avg Cost
+  const entryEl = document.getElementById(`entry-${n}`);
+  if (entryEl) {
+    entryEl.textContent = inPos && entry > 0 ? `$${fmt(entry, cfg.pxDec)}` : '--';
+  }
+
+  // Unrealized PnL
+  const upnlEl = document.getElementById(`upnl-${n}`);
+  if (upnlEl) {
+    if (inPos && qty > 0 && entry > 0 && px != null) {
+      const pnl = (px - entry) * qty;
+      const pct = ((px - entry) / entry * 100);
+      upnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
+      upnlEl.className   = `cc-row-val ${pnl >= 0 ? 'pos' : 'neg'}`;
+    } else {
+      upnlEl.textContent = '--';
+      upnlEl.className   = 'cc-row-val neu';
+    }
+  }
+
+  // Extra row: tranches for SOL, stop for others
+  const extraRow = document.getElementById(`extra-${n}`);
+  const extraLbl = document.getElementById(`extraLbl-${n}`);
+  const extraVal = document.getElementById(`extraVal-${n}`);
+  if (extraRow && extraLbl && extraVal) {
+    if (sym === 'SOL/USD') {
+      extraRow.style.display = 'flex';
+      extraLbl.textContent   = 'Tranches';
+      extraVal.textContent   = `${tranch} / 5`;
+    } else if (stop > 0) {
+      extraRow.style.display = 'flex';
+      extraLbl.textContent   = 'Stop';
+      extraVal.textContent   = `$${fmt(stop, cfg.pxDec)}`;
+    } else if (atr > 0 && inPos) {
+      // XRP/FET: computed stop = entry - 1.5 × ATR
+      const stopPx = entry - 1.5 * atr;
+      extraRow.style.display = 'flex';
+      extraLbl.textContent   = 'Stop';
+      extraVal.textContent   = `$${fmt(stopPx, cfg.pxDec)}`;
+    } else {
+      extraRow.style.display = 'none';
+    }
+  }
+
+  // Pending badge
+  const pendBadge = document.getElementById(`pending-${n}`);
+  if (pendBadge) {
+    if (pending) {
+      pendBadge.textContent = pending;
+      pendBadge.className   = `badge ${pending === 'BUY' ? 'bg-blue' : 'bg-yellow'}`;
+      pendBadge.style.display = 'inline-block';
+    } else {
+      pendBadge.style.display = 'none';
+    }
+  }
+}
+
+// ── Sentiment helper ─────────────────────────────────────────────────────────
+const SENTI_COLORS = { SEVERE_FEAR: 'bg-red', UNEASE: 'bg-yellow', NEUTRAL: 'bg-blue', HYPE: 'bg-green' };
+function classifyScore(s) {
+  if (s < -0.30) return 'SEVERE_FEAR';
+  if (s < -0.05) return 'UNEASE';
+  if (s <=  0.25) return 'NEUTRAL';
+  return 'HYPE';
+}
+function updateSenti(score, badgeId, scoreId, barId) {
+  const status = classifyScore(score);
+  const badge  = document.getElementById(badgeId);
+  const scoreEl = document.getElementById(scoreId);
+  const bar    = document.getElementById(barId);
+  if (badge)  { badge.textContent = status; badge.className = `badge ${SENTI_COLORS[status]}`; }
+  if (scoreEl) scoreEl.textContent = score.toFixed(3);
+  if (bar) {
+    const pct = Math.min(Math.max((score + 1) / 2 * 100, 0), 100);
+    bar.style.width      = pct + '%';
+    bar.style.background = score < -0.05 ? 'var(--red)' : score > 0.25 ? 'var(--green)' : 'var(--blue)';
+  }
+}
+
+// ── Fetch helpers ────────────────────────────────────────────────────────────
 async function fetchJSON(path) {
   try {
     const r = await fetch(`${API}${path}`);
@@ -169,222 +376,188 @@ async function fetchJSON(path) {
   } catch (e) { console.warn(`fetch ${path}:`, e); return null; }
 }
 
-async function pollPosition() {
-  const d = await fetchJSON('/api/position');
+async function pollPositions() {
+  const d = await fetchJSON('/api/positions');
   if (!d) return;
-
-  const qty = parseFloat(d.quantity) || 0;
-  const entry = d.entry_price || 0;
-  const sl = d.stop_loss_price || 0;
-
-  document.getElementById('posQty').textContent = qty > 0 ? `${qty.toFixed(4)} BTC` : 'FLAT';
-  document.getElementById('posQty').className = `stat ${qty > 0 ? 'pos' : 'neutral'}`;
-
-  document.getElementById('posEntry').textContent = entry > 0 ? `Entry: $${entry.toFixed(2)}` : '--';
-  document.getElementById('posStopLoss').textContent = sl > 0 ? `Stop-loss: $${sl.toFixed(2)}` : '--';
-
-  // Strategy state badges
-  const stateEl = document.getElementById('stratState');
-  stateEl.textContent = d.in_position ? 'IN POSITION' : 'OUT';
-  stateEl.className = `badge ${d.in_position ? 'badge-green' : 'badge-muted'}`;
-
-  const pendEl = document.getElementById('stratPending');
-  if (d.pending_action) {
-    pendEl.textContent = `PENDING ${d.pending_action}`;
-    pendEl.className = 'badge badge-yellow';
-  } else {
-    pendEl.textContent = 'IDLE';
-    pendEl.className = 'badge badge-muted';
-  }
-
-  document.getElementById('stratDetail').textContent =
-    d.in_position ? `Holding ${qty.toFixed(4)} @ $${entry.toFixed(2)}` : 'Waiting for entry signal';
-
-  // Sentiment badge
-  const sentBadge = document.getElementById('sentimentBadge');
-  sentBadge.textContent = d.sentiment || '--';
-  const sentColors = { SEVERE_FEAR: 'badge-red', UNEASE: 'badge-yellow', NEUTRAL: 'badge-blue', HYPE: 'badge-green' };
-  sentBadge.className = `badge ${sentColors[d.sentiment] || 'badge-muted'}`;
-
-  // Unrealised PNL
-  if (qty > 0 && entry > 0 && currentPrice > 0) {
-    const pnl = (currentPrice - entry) * qty;
-    const el = document.getElementById('unrealPnl');
-    el.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`;
-    el.className = `stat ${pnl >= 0 ? 'pos' : 'neg'}`;
-  } else {
-    const el = document.getElementById('unrealPnl');
-    el.textContent = '$0.00';
-    el.className = 'stat neutral';
+  for (const sym of Object.keys(d)) {
+    positions[sym] = d[sym];
+    updateCard(sym, d[sym]);
   }
 }
 
-async function pollBalance() {
-  const d = await fetchJSON('/api/balance');
-  const container = document.getElementById('walletContainer');
-  container.classList.remove('loading');
+async function pollPnl() {
+  const d = await fetchJSON('/api/pnl');
+  if (!d) return;
+  const color = v => v == null ? 'neu' : v >= 0 ? 'pos' : 'neg';
+  const fmtPnl = v => v == null ? '--' : `${v >= 0 ? '+' : ''}$${v.toFixed(2)}`;
 
-  if (!d || !d.Wallet) { container.textContent = 'Unavailable'; return; }
+  const re = document.getElementById('realizedPnl');
+  const ur = document.getElementById('unrealizedPnl');
+  const to = document.getElementById('totalPnl');
+  const wl = document.getElementById('winLoss');
 
-  const wallet = d.Wallet;
-  const assets = Object.keys(wallet).filter(a => {
-    const free = parseFloat(wallet[a].Free || 0);
-    const lock = parseFloat(wallet[a].Lock || 0);
-    return free > 0.00001 || lock > 0.00001;
-  });
+  re.textContent = fmtPnl(d.realized_pnl_usd);   re.className = `val ${color(d.realized_pnl_usd)}`;
+  ur.textContent = fmtPnl(d.unrealized_pnl_usd);  ur.className = `val ${color(d.unrealized_pnl_usd)}`;
+  to.textContent = fmtPnl(d.total_pnl_usd);       to.className = `val ${color(d.total_pnl_usd)}`;
 
-  if (assets.length === 0) { container.textContent = 'Empty'; return; }
-
-  container.innerHTML = assets.map(a => {
-    const free = parseFloat(wallet[a].Free || 0);
-    const lock = parseFloat(wallet[a].Lock || 0);
-    return `<div class="wallet-row">
-      <span class="wallet-asset">${a}</span>
-      <span><span class="wallet-free">${free.toFixed(4)}</span>${lock > 0.00001 ? ` <span class="wallet-locked">(${lock.toFixed(4)} locked)</span>` : ''}</span>
-    </div>`;
-  }).join('');
+  const w = d.winning_trades || 0;
+  const l = d.losing_trades  || 0;
+  const b = d.breakeven_trades || 0;
+  wl.textContent = `${w}W / ${l}L / ${b}BE`;
+  wl.style.color = w > l ? 'var(--green)' : l > w ? 'var(--red)' : 'var(--muted)';
 }
 
 async function pollTrades() {
   const d = await fetchJSON('/api/trades');
   const tbody = document.getElementById('tradesBody');
-  if (!d || d.length === 0) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No trades yet</td></tr>'; return; }
-
-  tbody.innerHTML = d.slice(0, 20).map(t => {
+  if (!d || d.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="neu" style="text-align:center">No trades yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.slice(0, 30).map(t => {
     const side = (t.Action || '').toUpperCase();
-    const cls = side === 'BUY' ? 'pos' : side === 'SELL' ? 'neg' : '';
+    const sideCls = side === 'BUY' ? 'pos' : side === 'SELL' ? 'neg' : '';
     const price = parseFloat(t.Price || 0);
-    const qty = parseFloat(t.Quantity || 0);
-    const ts = t.Timestamp || '--';
+    const qty   = parseFloat(t.Quantity || 0);
+    const ts    = t.Timestamp || '--';
     const short = ts.length > 19 ? ts.slice(11, 19) : ts;
-    const status = (t.API_Status || '').includes('SUCCESS') ? 'OK' : t.API_Status || '--';
+    const ok    = (t.API_Status || '').includes('SUCCESS');
+    const status = ok ? 'OK' : (t.API_Status || '--').slice(0, 8);
+    const pair  = (t.Pair || '--').replace('/USD', '');
     return `<tr>
-      <td style="color:var(--muted)">${short}</td>
-      <td class="${cls}" style="font-weight:600">${side}</td>
-      <td>$${price.toFixed(2)}</td>
-      <td>${qty.toFixed(6)}</td>
-      <td>${status}</td>
+      <td class="neu">${short}</td>
+      <td style="font-weight:600">${pair}</td>
+      <td class="${sideCls}" style="font-weight:700">${side}</td>
+      <td>$${price.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</td>
+      <td>${qty.toLocaleString('en-US', {maximumFractionDigits: 4})}</td>
+      <td class="${ok ? 'pos' : 'neg'}">${status}</td>
     </tr>`;
   }).join('');
 }
 
-// --- WebSocket ---
+// ── WebSocket ────────────────────────────────────────────────────────────────
 function connectWS() {
   ws = new WebSocket(WS_URL);
   const statusEl = document.getElementById('wsStatus');
 
-  ws.onopen = () => {
-    statusEl.innerHTML = '<span class="dot dot-green"></span> live';
-  };
-
+  ws.onopen  = () => { statusEl.innerHTML = '<span class="dot dot-green"></span> live'; };
   ws.onclose = () => {
     statusEl.innerHTML = '<span class="dot dot-red"></span> disconnected';
     setTimeout(connectWS, 3000);
   };
-
   ws.onerror = () => ws.close();
 
   ws.onmessage = (e) => {
     try {
-      const msg = JSON.parse(e.data);
-      const ch = msg.channel;
-      const data = msg.data;
+      const { channel: ch, data } = JSON.parse(e.data);
 
       if (ch === 'market_data') {
-        currentPrice = parseFloat(data.mid_price) || 0;
-        document.getElementById('marketPrice').textContent = `$${currentPrice.toFixed(2)}`;
-        document.getElementById('marketSymbol').textContent = data.symbol || '--';
+        const sym = data.symbol;
+        const px  = parseFloat(data.mid_price) || 0;
+        if (sym && px > 0) {
+          prices[sym] = px;
+          // Refresh card price + unrealized PnL immediately
+          const pos = positions[sym];
+          if (pos) updateCard(sym, pos);
+          else {
+            // Just update price display if card exists
+            const cfg = COINS.find(c => c.sym === sym);
+            if (cfg) {
+              const el = document.getElementById(`price-${cfg.name}`);
+              if (el) el.textContent = `$${fmt(px, cfg.pxDec)}`;
+            }
+          }
+        }
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+        return;   // skip generic event log for market_data (too noisy)
       }
 
       if (ch === 'sentiment_signals') {
         const score = parseFloat(data.compound_score) || 0;
-        document.getElementById('sentimentScore').textContent = score.toFixed(3);
-        const pct = Math.min(Math.max((score + 1) / 2 * 100, 0), 100);
-        const fill = document.getElementById('sentimentFill');
-        fill.style.width = pct + '%';
-        fill.style.background = score < -0.05 ? 'var(--red)' : score > 0.25 ? 'var(--green)' : 'var(--blue)';
+        updateSenti(score, 'gSentiBadge', 'gSentiScore', 'gSentiBar');
         if (data.latest_headline) {
-          document.getElementById('sentimentHeadline').textContent = data.latest_headline.slice(0, 80);
+          document.getElementById('latestHeadline').textContent = data.latest_headline.slice(0, 120);
         }
       }
 
+      if (ch === 'sentiment_signals_xrp') {
+        const score = parseFloat(data.compound_score) || 0;
+        updateSenti(score, 'xSentiBadge', 'xSentiScore', 'xSentiBar');
+      }
+
       if (ch === 'position_updates') {
-        pollPosition();
+        pollPositions();
       }
 
       if (ch === 'trade_signals') {
         const action = data.action || '?';
+        const sym    = data.symbol || '';
         const reason = data.reason || '';
-        addEvent(`SIGNAL ${action} — ${reason}`, action === 'BUY' ? 'pos' : 'neg');
+        const label  = sym ? `${sym.replace('/USD', '')} ${action}` : action;
+        addEvent(`SIGNAL ${label} — ${reason}`, action === 'BUY' ? 'pos' : 'neg');
         pollTrades();
       }
 
-      if (ch !== 'market_data') {
-        addEvent(`[${ch}] ${JSON.stringify(data).slice(0, 120)}`, 'neutral');
-      }
+      // Generic event log (skip market_data — handled above)
+      addEvent(`[${ch}] ${JSON.stringify(data).slice(0, 100)}`, 'neu');
+
     } catch (err) { console.warn('ws parse:', err); }
   };
 }
 
 function addEvent(text, cls) {
   events.unshift({ text, cls, ts: new Date().toLocaleTimeString() });
-  if (events.length > maxEvents) events.length = maxEvents;
-  const el = document.getElementById('eventLog');
-  el.innerHTML = events.map(e =>
-    `<div><span style="color:var(--muted)">${e.ts}</span> <span class="${e.cls}">${escapeHtml(e.text)}</span></div>`
+  if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+  document.getElementById('eventLog').innerHTML = events.map(ev =>
+    `<div><span class="neu">${ev.ts}</span> <span class="${ev.cls}">${escHtml(ev.text)}</span></div>`
   ).join('');
 }
 
-function escapeHtml(s) {
+function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// --- Kill/Resume with confirmation ---
+// ── Confirm dialog ───────────────────────────────────────────────────────────
 function showConfirm(action) {
   pendingAction = action;
-  document.getElementById('confirmTitle').textContent =
-    action === 'kill' ? 'Halt Pipeline' : 'Resume Pipeline';
-  document.getElementById('confirmMsg').textContent =
-    action === 'kill'
-      ? 'This will stop all trading immediately. Confirm?'
-      : 'This will resume automated trading. Confirm?';
+  document.getElementById('confirmTitle').textContent = action === 'kill' ? 'Halt Pipeline' : 'Resume Pipeline';
+  document.getElementById('confirmMsg').textContent   = action === 'kill'
+    ? 'This will stop all trading immediately. Confirm?'
+    : 'This will resume automated trading. Confirm?';
   const btn = document.getElementById('confirmBtn');
   btn.textContent = action === 'kill' ? 'HALT NOW' : 'RESUME';
-  btn.className = action === 'kill' ? 'btn-kill' : 'btn-resume';
+  btn.className   = action === 'kill' ? 'btn-kill' : 'btn-resume';
   document.getElementById('confirmOverlay').classList.add('active');
 }
-
 function hideConfirm() {
   document.getElementById('confirmOverlay').classList.remove('active');
   pendingAction = null;
 }
-
 async function executeAction() {
   if (!pendingAction) return;
   const endpoint = pendingAction === 'kill' ? '/api/kill' : '/api/resume';
+  const act = pendingAction;
   hideConfirm();
   try {
     const r = await fetch(`${API}${endpoint}`, { method: 'POST' });
     const d = await r.json();
-    addEvent(`CONTROL: ${d.command || d.message || 'sent'}`, pendingAction === 'kill' ? 'neg' : 'pos');
-  } catch (e) {
-    addEvent(`CONTROL ERROR: ${e.message}`, 'neg');
+    addEvent(`CONTROL: ${d.command || d.message || 'sent'}`, act === 'kill' ? 'neg' : 'pos');
+  } catch (err) {
+    addEvent(`CONTROL ERROR: ${err.message}`, 'neg');
   }
 }
-
-// close on Escape
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideConfirm(); });
 
-// --- Bootstrap ---
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+buildCoinGrid();
 connectWS();
-pollPosition();
-pollBalance();
+pollPositions();
+pollPnl();
 pollTrades();
 
-setInterval(pollPosition, 3000);
-setInterval(pollBalance, 10000);
-setInterval(pollTrades, 5000);
+setInterval(pollPositions, 3000);
+setInterval(pollPnl,       10000);
+setInterval(pollTrades,    5000);
 </script>
 </body>
 </html>

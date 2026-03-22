@@ -38,8 +38,11 @@ CONTROL_CHANNEL = "control"
 MARKET_DATA_CHANNEL = "market_data"
 TRADE_SIGNALS_CHANNEL = "trade_signals"
 SENTIMENT_SIGNALS_CHANNEL = "sentiment_signals"
+SENTIMENT_SIGNALS_XRP_CHANNEL = "sentiment_signals_xrp"
 POSITION_CHANNEL = "position_updates"
 POSITION_KEY = "position:current"
+
+STRATEGY_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "FET/USD"]
 
 BALANCE_URL = "https://mock-api.roostoo.com/v3/balance"
 CSV_FILE = Path(os.getenv("LOG_FILE", "logs/execution_log.csv"))
@@ -481,6 +484,50 @@ async def get_position() -> Any:
     return json.loads(raw)
 
 
+@app.get("/api/positions")
+async def get_all_positions() -> dict:
+    """Return position state for all active strategy symbols."""
+    redis_client: aioredis.Redis = app.state.redis
+    latest_prices: dict[str, float] = getattr(app.state, "latest_prices", {})
+    result = {}
+    for sym in STRATEGY_SYMBOLS:
+        key = f"strategy_state:{sym}"
+        try:
+            state = await redis_client.hgetall(key)
+        except aioredis.RedisError:
+            state = {}
+
+        in_pos   = state.get("in_position", "False").lower() == "true"
+        qty      = float(state.get("open_position_quantity", "0") or "0")
+        # SOL DCA uses average_cost; BTC/ETH/XRP/FET use entry_price
+        entry    = float(state.get("average_cost") or state.get("entry_price", "0") or "0")
+        stop_px  = float(state.get("stop_loss_price", "0") or "0")
+        atr_entry = float(state.get("atr_at_entry", "0") or "0")
+        tranches = int(state.get("tranche_count", "0") or "0")
+        pending  = state.get("pending_action") or None
+        cooldown = float(state.get("cooldown_until", "0") or "0")
+
+        current_price = latest_prices.get(sym)
+        unrealized_pnl: float | None = None
+        if in_pos and qty > 0 and entry > 0 and current_price:
+            unrealized_pnl = round((current_price - entry) * qty * (1 - TRADING_FEE_RATE), 2)
+
+        result[sym] = {
+            "symbol":           sym,
+            "in_position":      in_pos,
+            "quantity":         qty,
+            "entry_price":      entry,
+            "stop_loss_price":  stop_px,
+            "atr_at_entry":     atr_entry,
+            "tranche_count":    tranches,
+            "pending_action":   pending,
+            "current_price":    current_price,
+            "unrealized_pnl":   unrealized_pnl,
+            "cooldown_until":   cooldown,
+        }
+    return result
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
     html_path = Path(__file__).parent / "dashboard.html"
@@ -500,13 +547,15 @@ async def websocket_stream(websocket: WebSocket) -> None:
             MARKET_DATA_CHANNEL,
             TRADE_SIGNALS_CHANNEL,
             SENTIMENT_SIGNALS_CHANNEL,
+            SENTIMENT_SIGNALS_XRP_CHANNEL,
             POSITION_CHANNEL,
         )
         log.info(
-            "WebSocket subscribed to channels: %s, %s, %s, %s",
+            "WebSocket subscribed to channels: %s, %s, %s, %s, %s",
             MARKET_DATA_CHANNEL,
             TRADE_SIGNALS_CHANNEL,
             SENTIMENT_SIGNALS_CHANNEL,
+            SENTIMENT_SIGNALS_XRP_CHANNEL,
             POSITION_CHANNEL,
         )
 
@@ -546,6 +595,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
                 MARKET_DATA_CHANNEL,
                 TRADE_SIGNALS_CHANNEL,
                 SENTIMENT_SIGNALS_CHANNEL,
+                SENTIMENT_SIGNALS_XRP_CHANNEL,
                 POSITION_CHANNEL,
             )
         with suppress(Exception):

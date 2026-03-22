@@ -775,9 +775,16 @@ def execute_trade_signal(
             effective_qty = _floor_to_decimals(available_qty, 4)
             requested_qty = available_qty
         else:
-            effective_qty = min(requested_qty, max(available_qty - SELL_QTY_EPSILON, 0.0))
-
-        effective_qty = _floor_to_decimals(effective_qty, 8)
+            decimals = _pair_step_decimals(pair)
+            if decimals == 0:
+                # Integer-quantity pairs: epsilon subtraction causes floor() to drop a whole unit.
+                # Skip epsilon; just floor to 0 decimals directly.
+                effective_qty = _floor_to_decimals(min(requested_qty, max(available_qty, 0.0)), 0)
+            else:
+                effective_qty = _floor_to_decimals(
+                    min(requested_qty, max(available_qty - SELL_QTY_EPSILON, 0.0)),
+                    decimals,
+                )
 
         if effective_qty < MIN_TRADABLE_QTY:
             result = _build_order_result(
@@ -819,7 +826,7 @@ def execute_trade_signal(
         redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
         return result
 
-    quantity = f"{effective_qty:.8f}"
+    quantity = _format_qty_for_pair(pair, effective_qty)
 
     params = {
         "pair": pair,

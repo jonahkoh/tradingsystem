@@ -67,6 +67,10 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         # Breakout delta
         sol.prev_price = None
 
+        # EMA(7)/EMA(99) death-cross state
+        sol.ema_fast = None
+        sol.ema_slow = None
+
         # Execution handshake
         sol.pending_action         = None
         sol.pending_action_since   = 0.0
@@ -409,8 +413,8 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         self.assertEqual(payload["action"], "SELL")
         self.assertIn("BB_MeanReversion", payload["reason"])
 
-    def test_breakout_take_profit(self):
-        """TRENDING_UP entry → TP fires at average_cost × BREAKOUT_TP_MULT."""
+    def test_breakout_take_profit_via_death_cross(self):
+        """TRENDING_UP entry → TP fires when EMA7 < EMA99 and price > avg + 2×fee."""
         redis_stub = _RedisStub()
         self._seed_warmup(100.0)
         sol.in_position            = True
@@ -419,12 +423,33 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         sol.atr_at_entry           = 0.5
         sol.entry_regime           = "TRENDING_UP"
 
-        tp = 100.0 * sol.BREAKOUT_TP_MULT   # default 1.05 → 105
-        asyncio.run(sol.evaluate_market_tick(tp + 0.01, "SOL/USD", 1, redis_stub))
+        # Force death cross: ema_fast < ema_slow
+        sol.ema_fast = 99.0
+        sol.ema_slow = 101.0
+        # Price must be above average_cost × (1 + 2×fee) ≈ 100.2
+        asyncio.run(sol.evaluate_market_tick(101.0, "SOL/USD", 1, redis_stub))
 
         self.assertEqual(len(redis_stub.messages), 1)
         payload = json.loads(redis_stub.messages[0][1])
-        self.assertIn("Breakout_TakeProfit", payload["reason"])
+        self.assertEqual(payload["action"], "SELL")
+        self.assertIn("EMA_DeathCross", payload["reason"])
+
+    def test_breakout_no_exit_without_death_cross(self):
+        """TRENDING_UP entry does NOT exit while EMA7 > EMA99 (uptrend intact)."""
+        redis_stub = _RedisStub()
+        self._seed_warmup(100.0)
+        sol.in_position            = True
+        sol.open_position_quantity = "100"
+        sol.average_cost           = 100.0
+        sol.atr_at_entry           = 0.5
+        sol.entry_regime           = "TRENDING_UP"
+
+        # No death cross: fast > slow
+        sol.ema_fast = 102.0
+        sol.ema_slow = 100.0
+        asyncio.run(sol.evaluate_market_tick(105.0, "SOL/USD", 1, redis_stub))
+
+        self.assertEqual(len(redis_stub.messages), 0)
 
     def test_dca_take_profit(self):
         """DCA entry → TP fires at average_cost × (1 + PROFIT_MARGIN)."""
@@ -445,7 +470,7 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         self.assertIn("DCA_TakeProfit", payload["reason"])
 
     def test_wrong_entry_regime_does_not_trigger_tp_early(self):
-        """BB TP threshold (SMA) is not used for TRENDING_UP entry; uses BREAKOUT_TP_MULT."""
+        """BB TP threshold (SMA) is not used for TRENDING_UP entry; uses EMA death cross."""
         redis_stub = _RedisStub()
         self._seed_warmup(100.0)
         sol.in_position            = True
@@ -454,7 +479,9 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         sol.atr_at_entry           = 0.5
         sol.entry_regime           = "TRENDING_UP"
 
-        # Price at SMA (100) — would trigger BB TP but NOT breakout TP (needs 105)
+        # No death cross (fast > slow) → no exit even though price is at SMA
+        sol.ema_fast = 102.0
+        sol.ema_slow = 100.0
         asyncio.run(sol.evaluate_market_tick(100.5, "SOL/USD", 1, redis_stub))
 
         self.assertEqual(len(redis_stub.messages), 0)
@@ -699,6 +726,81 @@ class SolAdaptiveStrategyTests(unittest.TestCase):
         """Score above 0.25 → HYPE scalar."""
         sol.global_sentiment_score = 0.50
         self.assertAlmostEqual(sol._sentiment_scalar(), sol.SENTIMENT_SCALAR_HYPE)
+
+    # ── EMA helpers ────────────────────────────────────────────────────────────
+    def test_update_emas_initializes_on_first_call(self):
+        """_update_emas seeds both EMAs to current price on first call."""
+        sol.ema_fast = None
+        sol.ema_slow = None
+        sol._update_emas(150.0)
+        self.assertAlmostEqual(sol.ema_fast, 150.0)
+        self.assertAlmostEqual(sol.ema_slow, 150.0)
+
+    def test_update_emas_wilder_smoothing(self):
+        """_update_emas applies exponential smoothing on subsequent calls."""
+        sol._update_emas(100.0)   # seed
+        prev_fast = sol.ema_fast
+        sol._update_emas(110.0)
+        expected_fast = sol.alpha_fast * 110.0 + (1 - sol.alpha_fast) * prev_fast
+        self.assertAlmostEqual(sol.ema_fast, expected_fast, places=8)
+
+    def test_death_cross_true_when_fast_below_slow(self):
+        """_death_cross returns True when ema_fast < ema_slow."""
+        sol.ema_fast = 99.0
+        sol.ema_slow = 101.0
+        self.assertTrue(sol._death_cross())
+
+    def test_death_cross_false_when_fast_above_slow(self):
+        """_death_cross returns False when ema_fast > ema_slow."""
+        sol.ema_fast = 101.0
+        sol.ema_slow = 99.0
+        self.assertFalse(sol._death_cross())
+
+    def test_death_cross_false_when_emas_none(self):
+        """_death_cross returns False when EMAs are not yet initialized."""
+        sol.ema_fast = None
+        sol.ema_slow = None
+        self.assertFalse(sol._death_cross())
+
+    # ── Minimum stop floor ─────────────────────────────────────────────────────
+    def test_min_stop_floor_prevents_tight_stop(self):
+        """In flat market (tiny ATR), stop is widened by MIN_STOP_PCT floor."""
+        redis_stub = _RedisStub()
+        self._seed_warmup(100.0)
+        sol.in_position            = True
+        sol.open_position_quantity = "100"
+        sol.average_cost           = 100.0
+        # Very tiny ATR → ATR stop would be at 100 - 2×0.001 = 99.998 (too tight)
+        sol.atr_at_entry           = 0.001
+        sol.entry_regime           = "UNCLEAR"
+
+        # floor_stop = 100 × (1 - 0.005) = 99.5
+        # atr_stop   = 100 - ATR_STOPLOSS_K × 0.001 ≈ 99.998
+        # stop_price = min(atr_stop, floor_stop) = 99.5 (floor is wider)
+        floor_stop = sol.average_cost * (1.0 - sol.MIN_STOP_PCT)
+        # Price just below floor_stop should trigger
+        asyncio.run(sol.evaluate_market_tick(floor_stop - 0.01, "SOL/USD", 1, redis_stub))
+
+        self.assertEqual(len(redis_stub.messages), 1)
+        payload = json.loads(redis_stub.messages[0][1])
+        self.assertEqual(payload["action"], "SELL")
+        self.assertIn("ATR_StopLoss", payload["reason"])
+
+    def test_atr_stop_wider_than_floor_is_used(self):
+        """When ATR stop is wider than MIN_STOP_PCT floor, ATR stop is used."""
+        redis_stub = _RedisStub()
+        self._seed_warmup(100.0)
+        sol.in_position            = True
+        sol.open_position_quantity = "100"
+        sol.average_cost           = 100.0
+        sol.atr_at_entry           = 5.0   # stop = 100 - K×5 (much lower than 0.5% floor)
+        sol.entry_regime           = "UNCLEAR"
+
+        # floor_stop = 99.5; atr_stop ≈ 90 (for K=2) or lower
+        # Wider stop = 90; price at 99 should NOT trigger
+        asyncio.run(sol.evaluate_market_tick(99.0, "SOL/USD", 1, redis_stub))
+
+        self.assertEqual(len(redis_stub.messages), 0)
 
 
 if __name__ == "__main__":

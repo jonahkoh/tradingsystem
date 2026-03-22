@@ -102,9 +102,13 @@ WARMUP_TICKS = SMA50_PERIOD
 # ── RANGING: Bollinger Band Mean Reversion ────────────────────────────────────
 BB_PROFIT_MARGIN = float(os.getenv("SOL_BB_PROFIT_MARGIN", "0.005"))  # 0.5% min gain at exit
 
-# ── TRENDING_UP: ATR Breakout ─────────────────────────────────────────────────
-ATR_BREAKOUT_K   = float(os.getenv("SOL_ATR_BREAKOUT_K",   "2.0"))
-BREAKOUT_TP_MULT = float(os.getenv("SOL_BREAKOUT_TP_MULT", "1.05"))  # +5%
+# ── TRENDING_UP: ATR Breakout + EMA death-cross exit ─────────────────────────
+ATR_BREAKOUT_K = float(os.getenv("SOL_ATR_BREAKOUT_K", "2.0"))
+EMA_FAST_PERIOD = int(os.getenv("SOL_EMA_FAST_PERIOD", "7"))    # fast EMA for cross exit
+EMA_SLOW_PERIOD = int(os.getenv("SOL_EMA_SLOW_PERIOD", "99"))   # slow EMA for cross exit
+
+# ── Stop-loss floor ───────────────────────────────────────────────────────────
+MIN_STOP_PCT = float(os.getenv("SOL_MIN_STOP_PCT", "0.005"))     # 0.5% min stop distance
 
 # ── TRENDING_DOWN / UNCLEAR: DCA Tranches ────────────────────────────────────
 PROFIT_MARGIN   = float(os.getenv("SOL_DCA_PROFIT_MARGIN", "0.02"))   # 2% TP
@@ -179,6 +183,12 @@ pending_sell_price: float       = 0.0   # price at time of SELL signal for retur
 
 # ── Breakout: previous tick price for delta ───────────────────────────────────
 prev_price: float | None = None
+
+# ── EMA(7) / EMA(99) for death-cross exit ────────────────────────────────────
+ema_fast: float | None = None   # EMA(7)
+ema_slow: float | None = None   # EMA(99)
+alpha_fast: float = 2.0 / (EMA_FAST_PERIOD + 1)
+alpha_slow: float = 2.0 / (EMA_SLOW_PERIOD + 1)
 
 # ── Execution Handshake ───────────────────────────────────────────────────────
 pending_action:       str | None = None
@@ -278,6 +288,22 @@ def _bollinger_bands(sma: float) -> tuple[float, float]:
     variance = sum((p - sma) ** 2 for p in sma_prices) / len(sma_prices)
     std = math.sqrt(variance)
     return sma + BB_STD_MULT * std, sma - BB_STD_MULT * std
+
+
+# ── EMA Update ────────────────────────────────────────────────────────────────
+def _update_emas(price: float) -> None:
+    global ema_fast, ema_slow
+    if ema_fast is None:
+        ema_fast = price
+        ema_slow = price
+    else:
+        ema_fast = alpha_fast * price + (1 - alpha_fast) * ema_fast
+        ema_slow = alpha_slow * price + (1 - alpha_slow) * ema_slow
+
+
+def _death_cross() -> bool:
+    """Returns True when EMA7 has crossed below EMA99 (trend exhaustion)."""
+    return ema_fast is not None and ema_slow is not None and ema_fast < ema_slow
 
 
 # ── Regime Detection ──────────────────────────────────────────────────────────
@@ -446,8 +472,9 @@ async def evaluate_market_tick(
     if symbol != TRADE_SYMBOL or price <= 0:
         return
 
-    # ATR + price window updates
+    # ATR + price window + EMA updates
     _compute_atr(price)
+    _update_emas(price)
     sma_prices.append(price)
     sma50_prices.append(price)
 
@@ -469,9 +496,10 @@ async def evaluate_market_tick(
 
     log.info(
         "px=%.4f | SMA20=%.4f | SMA50=%.4f | BB[%.4f/%.4f] | "
-        "regime=%s(cand=%s %dt) | avg=%.4f | tr=%d/%d | ATR=%.6f | "
-        "senti=%.4f(%.2f×s %.2f×sh) | %s",
+        "EMA7=%.4f EMA99=%.4f | regime=%s(cand=%s %dt) | avg=%.4f | "
+        "tr=%d/%d | ATR=%.6f | senti=%.4f(%.2f×s %.2f×sh) | %s",
         price, sma20, sma50, bb_upper, bb_lower,
+        ema_fast or 0.0, ema_slow or 0.0,
         current_regime, candidate_regime, candidate_ticks,
         average_cost, tranche_count, MAX_TRANCHES,
         atr_value,
@@ -494,12 +522,13 @@ async def evaluate_market_tick(
 
     # ── EXITS (highest priority, regime-agnostic) ─────────────────────────────
     if in_position:
-        # 1. ATR stop-loss
-        stop_price = (
-            average_cost - ATR_STOPLOSS_K * atr_at_entry
-            if atr_at_entry > 0
-            else average_cost * FALLBACK_STOP
-        )
+        # 1. ATR stop-loss with minimum floor to prevent stop-hunting in flat markets
+        if atr_at_entry > 0:
+            atr_stop   = average_cost - ATR_STOPLOSS_K * atr_at_entry
+            floor_stop = average_cost * (1.0 - MIN_STOP_PCT)
+            stop_price = min(atr_stop, floor_stop)   # wider of the two
+        else:
+            stop_price = average_cost * FALLBACK_STOP
         if price <= stop_price:
             sell_qty              = open_position_quantity
             pending_action        = "SELL"
@@ -519,18 +548,21 @@ async def evaluate_market_tick(
             prev_price = price
             return
 
-        # 2. Take-profit — threshold depends on the regime under which we entered
+        # 2. Exit — threshold depends on the regime under which we entered
         if entry_regime == "RANGING":
             take_profit = max(sma20, average_cost * (1.0 + BB_PROFIT_MARGIN))
-            tp_reason   = f"BB_MeanReversion_exit_sma={sma20:.4f}_avg={average_cost:.4f}"
+            tp_triggered = price >= take_profit
+            tp_reason    = f"BB_MeanReversion_exit_sma={sma20:.4f}_avg={average_cost:.4f}"
         elif entry_regime == "TRENDING_UP":
-            take_profit = average_cost * BREAKOUT_TP_MULT
-            tp_reason   = f"Breakout_TakeProfit_{int((BREAKOUT_TP_MULT - 1) * 100)}pct_avg={average_cost:.4f}"
+            # Death cross: EMA7 crosses below EMA99 — trend exhaustion exit
+            tp_triggered = _death_cross() and price > average_cost * (1.0 + TRADING_FEE_RATE * 2)
+            tp_reason    = f"EMA_DeathCross_fast={ema_fast:.4f}_slow={ema_slow:.4f}_avg={average_cost:.4f}"
         else:
-            take_profit = average_cost * (1.0 + PROFIT_MARGIN)
-            tp_reason   = f"DCA_TakeProfit_{int(PROFIT_MARGIN * 100)}pct_avg={average_cost:.4f}_tr={tranche_count}"
+            take_profit  = average_cost * (1.0 + PROFIT_MARGIN)
+            tp_triggered = price >= take_profit
+            tp_reason    = f"DCA_TakeProfit_{int(PROFIT_MARGIN * 100)}pct_avg={average_cost:.4f}_tr={tranche_count}"
 
-        if price >= take_profit:
+        if tp_triggered:
             sell_qty              = open_position_quantity
             pending_action        = "SELL"
             pending_action_since  = time.time()
@@ -646,7 +678,7 @@ async def evaluate_market_tick(
 async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis.Redis) -> None:
     global in_position, open_position_quantity, pending_action, average_cost
     global atr_at_entry, pending_sell_quantity, pending_sell_price, boot_liquidation_pending
-    global tranche_count, last_buy_price, entry_regime
+    global tranche_count, last_buy_price, entry_regime, ema_fast, ema_slow
 
     try:
         data = json.loads(raw_payload)
@@ -683,6 +715,8 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         tranche_count            = 0
         last_buy_price           = 0.0
         entry_regime             = ""
+        ema_fast                 = None
+        ema_slow                 = None
         await _save_state(redis_client)
         log.info(
             "Startup liquidation %s for %s.",
@@ -892,13 +926,13 @@ async def run() -> None:
 
     log.info(
         "SOL Adaptive Multi-Regime Strategy starting | symbol=%s | "
-        "regimes=[RANGING→BB, TRENDING_UP→Breakout, TRENDING_DOWN→DCA, UNCLEAR→DCA×0.5] | "
+        "regimes=[RANGING→BB, TRENDING_UP→EMA(%d/%d)DeathCross, TRENDING_DOWN→DCA, UNCLEAR→DCA×0.5] | "
         "dwell_ticks=%d | risk_per_trade=$%.0f | sharpe_window=%d | "
-        "bb_profit=%.1f%% | breakout_tp=%.1f%% | dca_profit=%.1f%% | "
+        "bb_profit=%.1f%% | dca_profit=%.1f%% | min_stop=%.1f%% | "
         "target_notional=$%.0f (%.0f%% of $%.0f)",
-        TRADE_SYMBOL,
+        TRADE_SYMBOL, EMA_FAST_PERIOD, EMA_SLOW_PERIOD,
         REGIME_DWELL_TICKS, RISK_PER_TRADE_USD, SHARPE_WINDOW,
-        BB_PROFIT_MARGIN * 100, (BREAKOUT_TP_MULT - 1) * 100, PROFIT_MARGIN * 100,
+        BB_PROFIT_MARGIN * 100, PROFIT_MARGIN * 100, MIN_STOP_PCT * 100,
         TARGET_ORDER_USD, SOL_ALLOCATION * 100, PORTFOLIO_USD,
     )
 

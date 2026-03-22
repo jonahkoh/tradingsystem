@@ -193,6 +193,28 @@ def _extract_available_balance(response_json: Any, asset: str) -> float:
     if not isinstance(response_json, dict):
         return 0.0
 
+    # Roostoo balance shape:
+    # {"Success": true, "Wallet": {"BTC": {"Free": 0.1, "Lock": 0.0}, ...}}
+    for wallet_key in ("Wallet", "SpotWallet"):
+        wallet = response_json.get(wallet_key)
+        if isinstance(wallet, dict):
+            asset_block = wallet.get(asset.upper())
+            if asset_block is None:
+                # Fallback for case-mismatched keys.
+                for key, value in wallet.items():
+                    if str(key).upper() == asset.upper():
+                        asset_block = value
+                        break
+            if isinstance(asset_block, dict):
+                free_val = asset_block.get("Free")
+                if free_val is None:
+                    free_val = asset_block.get("free")
+                if free_val is not None:
+                    try:
+                        return float(free_val)
+                    except (TypeError, ValueError):
+                        pass
+
     candidates = response_json.get("Data")
     if isinstance(candidates, dict):
         candidates = [candidates]
@@ -225,8 +247,102 @@ def _extract_available_balance(response_json: Any, asset: str) -> float:
     return 0.0
 
 
+def _extract_locked_balance(response_json: Any, asset: str) -> float:
+    if not isinstance(response_json, dict):
+        return 0.0
+
+    for wallet_key in ("Wallet", "SpotWallet"):
+        wallet = response_json.get(wallet_key)
+        if isinstance(wallet, dict):
+            asset_block = wallet.get(asset.upper())
+            if asset_block is None:
+                for key, value in wallet.items():
+                    if str(key).upper() == asset.upper():
+                        asset_block = value
+                        break
+            if isinstance(asset_block, dict):
+                lock_val = asset_block.get("Lock")
+                if lock_val is None:
+                    lock_val = asset_block.get("Locked")
+                if lock_val is None:
+                    lock_val = asset_block.get("lock")
+                if lock_val is not None:
+                    try:
+                        return float(lock_val)
+                    except (TypeError, ValueError):
+                        pass
+
+    candidates = response_json.get("Data")
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+
+    if not isinstance(candidates, list):
+        candidates = [response_json]
+
+    asset_upper = asset.upper()
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = str(item.get("Asset") or item.get("Coin") or item.get("Currency") or "").upper()
+        if symbol and symbol != asset_upper:
+            continue
+
+        locked = item.get("Lock")
+        if locked is None:
+            locked = item.get("Locked")
+        if locked is None:
+            continue
+
+        try:
+            return float(locked)
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
+
+
+def _get_balance_snapshot(http_client: httpx.Client, pair: str) -> tuple[float, float]:
+    base_asset = _base_asset_from_pair(pair)
+    timestamp = _current_ms()
+    params = {"timestamp": timestamp}
+    payload = _sorted_params_string(params)
+    signature = _sign_message(SECRET_KEY, payload)
+    headers = {
+        "RST-API-KEY": API_KEY,
+        "MSG-SIGNATURE": signature,
+    }
+
+    url = f"{ROOSTOO_BASE_URL}{BALANCE_URL_PATH}"
+    response = http_client.get(url, params={"timestamp": str(timestamp)}, headers=headers)
+
+    try:
+        response_json = response.json()
+    except ValueError:
+        response_json = None
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"balance lookup failed: {response.status_code} {response.text}")
+
+    free_qty = _extract_available_balance(response_json, base_asset)
+    locked_qty = _extract_locked_balance(response_json, base_asset)
+    return free_qty, locked_qty
+
+
+def _base_asset_from_pair(pair: str) -> str:
+    pair_upper = pair.strip().upper()
+    if "/" in pair_upper:
+        return pair_upper.split("/", 1)[0]
+
+    for quote in ("USDT", "USDC", "BUSD", "USD"):
+        if pair_upper.endswith(quote) and len(pair_upper) > len(quote):
+            return pair_upper[: -len(quote)]
+
+    return pair_upper
+
+
 def _get_available_base_balance(http_client: httpx.Client, pair: str) -> float:
-    base_asset = pair.split("/")[0].strip().upper()
+    base_asset = _base_asset_from_pair(pair)
     timestamp = _current_ms()
     params = {"timestamp": timestamp}
     payload = _sorted_params_string(params)
@@ -310,9 +426,21 @@ def execute_trade_signal(
     effective_qty = requested_qty
 
     if side == "SELL":
-        available_qty = _get_available_base_balance(http_client, pair)
+        available_qty, locked_qty = _get_balance_snapshot(http_client, pair)
+        if available_qty < MIN_TRADABLE_QTY and locked_qty > MIN_TRADABLE_QTY:
+            log.warning(
+                "SELL requested but free balance is low while locked balance exists (free=%.8f locked=%.8f). "
+                "Cancelling open orders and retrying free balance.",
+                available_qty,
+                locked_qty,
+            )
+            _cancel_all_open_orders(http_client, pair)
+            time.sleep(0.2)
+            available_qty = _get_available_base_balance(http_client, pair)
+
         if quantity.upper() == "ALL":
-            effective_qty = max(available_qty - SELL_QTY_EPSILON, 0.0)
+            # SELL ALL should use exchange-compatible precision to avoid step-size rejects.
+            effective_qty = _floor_to_decimals(available_qty, 4)
             requested_qty = available_qty
         else:
             effective_qty = min(requested_qty, max(available_qty - SELL_QTY_EPSILON, 0.0))
@@ -332,7 +460,7 @@ def execute_trade_signal(
                 response_json=None,
                 raw_error=(
                     "sell skipped: insufficient available balance after clamp "
-                    f"(requested={requested_qty:.8f}, available={available_qty:.8f})"
+                    f"(requested={requested_qty:.8f}, available={available_qty:.8f}, locked={locked_qty:.8f})"
                 ),
             )
             redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
@@ -538,25 +666,40 @@ def run() -> None:
                 r.ping()
                 log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
-                base_available = _get_available_base_balance(http_client, DEFAULT_PAIR)
-                if base_available > MIN_TRADABLE_QTY:
+                base_free, base_locked = _get_balance_snapshot(http_client, DEFAULT_PAIR)
+                base_total = base_free + base_locked
+
+                if base_total > MIN_TRADABLE_QTY:
+                    if base_locked > MIN_TRADABLE_QTY:
+                        log.warning(
+                            "Startup sync found locked balance %.8f. Cancelling open orders first.",
+                            base_locked,
+                        )
+                        _cancel_all_open_orders(http_client, DEFAULT_PAIR)
+                        time.sleep(0.2)
+                        base_free = _get_available_base_balance(http_client, DEFAULT_PAIR)
+
                     log.warning(
-                        "Startup balance sync found leftover %.8f. Triggering emergency SELL ALL.",
-                        base_available,
+                        "Startup balance sync found free %.8f (total %.8f). Triggering emergency SELL ALL.",
+                        base_free,
+                        base_total,
                     )
-                    startup_signal = {
-                        "action": "SELL",
-                        "symbol": DEFAULT_PAIR,
-                        "type": "MARKET",
-                        "quantity": "ALL",
-                        "reason": "STARTUP_BALANCE_SYNC",
-                    }
-                    startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
-                    _publish_execution_confirmation(
-                        r,
-                        signal_payload=startup_signal,
-                        result_payload=startup_result,
-                    )
+                    if base_free > MIN_TRADABLE_QTY:
+                        startup_signal = {
+                            "action": "SELL",
+                            "symbol": DEFAULT_PAIR,
+                            "type": "MARKET",
+                            "quantity": "ALL",
+                            "reason": "STARTUP_BALANCE_SYNC",
+                        }
+                        startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
+                        _publish_execution_confirmation(
+                            r,
+                            signal_payload=startup_signal,
+                            result_payload=startup_result,
+                        )
+                    else:
+                        log.warning("Startup sync could not free locked balance yet; SELL ALL skipped this cycle.")
                 else:
                     startup_clear_signal = {
                         "action": "SELL",

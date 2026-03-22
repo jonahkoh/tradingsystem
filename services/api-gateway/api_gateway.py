@@ -20,6 +20,7 @@ import httpx
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
@@ -182,6 +183,11 @@ def _read_last_trades(csv_file: Path, limit: int = TRADES_LIMIT) -> list[dict[st
         raise HTTPException(status_code=500, detail="Unable to read trades log") from exc
 
     return [_normalize_trade_row(dict(row)) for row in reversed(rows)]
+
+
+@app.get("/")
+async def dashboard() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "dashboard.html")
 
 
 @app.get("/health")

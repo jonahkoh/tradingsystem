@@ -666,60 +666,62 @@ def run() -> None:
                 r.ping()
                 log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
-                base_free, base_locked = _get_balance_snapshot(http_client, DEFAULT_PAIR)
-                base_total = base_free + base_locked
-
-                if base_total > MIN_TRADABLE_QTY:
-                    if base_locked > MIN_TRADABLE_QTY:
-                        log.warning(
-                            "Startup sync found locked balance %.8f. Cancelling open orders first.",
-                            base_locked,
-                        )
-                        _cancel_all_open_orders(http_client, DEFAULT_PAIR)
-                        time.sleep(0.2)
-                        base_free = _get_available_base_balance(http_client, DEFAULT_PAIR)
-
-                    log.warning(
-                        "Startup balance sync found free %.8f (total %.8f). Triggering emergency SELL ALL.",
-                        base_free,
-                        base_total,
-                    )
-                    if base_free > MIN_TRADABLE_QTY:
-                        startup_signal = {
-                            "action": "SELL",
-                            "symbol": DEFAULT_PAIR,
-                            "type": "MARKET",
-                            "quantity": "ALL",
-                            "reason": "STARTUP_BALANCE_SYNC",
-                        }
-                        startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
-                        _publish_execution_confirmation(
-                            r,
-                            signal_payload=startup_signal,
-                            result_payload=startup_result,
-                        )
-                    else:
-                        log.warning("Startup sync could not free locked balance yet; SELL ALL skipped this cycle.")
-                else:
-                    startup_clear_signal = {
-                        "action": "SELL",
-                        "symbol": DEFAULT_PAIR,
-                        "type": "MARKET",
-                        "quantity": "0",
-                        "reason": "STARTUP_BALANCE_SYNC_CLEAR",
-                    }
-                    startup_clear_result = {
-                        "result": "SUCCESS",
-                        "status_code": 200,
-                        "requested_qty": 0.0,
-                        "effective_qty": 0.0,
-                    }
-                    _publish_execution_confirmation(
-                        r,
-                        signal_payload=startup_clear_signal,
-                        result_payload=startup_clear_result,
-                    )
-                    log.info("Startup balance sync clear: no leftover base asset.")
+                # DISABLED: startup sell-all liquidation — commented out for dashboard testing
+                # base_free, base_locked = _get_balance_snapshot(http_client, DEFAULT_PAIR)
+                # base_total = base_free + base_locked
+                #
+                # if base_total > MIN_TRADABLE_QTY:
+                #     if base_locked > MIN_TRADABLE_QTY:
+                #         log.warning(
+                #             "Startup sync found locked balance %.8f. Cancelling open orders first.",
+                #             base_locked,
+                #         )
+                #         _cancel_all_open_orders(http_client, DEFAULT_PAIR)
+                #         time.sleep(0.2)
+                #         base_free = _get_available_base_balance(http_client, DEFAULT_PAIR)
+                #
+                #     log.warning(
+                #         "Startup balance sync found free %.8f (total %.8f). Triggering emergency SELL ALL.",
+                #         base_free,
+                #         base_total,
+                #     )
+                #     if base_free > MIN_TRADABLE_QTY:
+                #         startup_signal = {
+                #             "action": "SELL",
+                #             "symbol": DEFAULT_PAIR,
+                #             "type": "MARKET",
+                #             "quantity": "ALL",
+                #             "reason": "STARTUP_BALANCE_SYNC",
+                #         }
+                #         startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
+                #         _publish_execution_confirmation(
+                #             r,
+                #             signal_payload=startup_signal,
+                #             result_payload=startup_result,
+                #         )
+                #     else:
+                #         log.warning("Startup sync could not free locked balance yet; SELL ALL skipped this cycle.")
+                # else:
+                #     startup_clear_signal = {
+                #         "action": "SELL",
+                #         "symbol": DEFAULT_PAIR,
+                #         "type": "MARKET",
+                #         "quantity": "0",
+                #         "reason": "STARTUP_BALANCE_SYNC_CLEAR",
+                #     }
+                #     startup_clear_result = {
+                #         "result": "SUCCESS",
+                #         "status_code": 200,
+                #         "requested_qty": 0.0,
+                #         "effective_qty": 0.0,
+                #     }
+                #     _publish_execution_confirmation(
+                #         r,
+                #         signal_payload=startup_clear_signal,
+                #         result_payload=startup_clear_result,
+                #     )
+                #     log.info("Startup balance sync clear: no leftover base asset.")
+                log.info("Startup liquidation DISABLED for dashboard testing.")
 
                 pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(SIGNALS_CHANNEL, CONTROL_CHANNEL)

@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY services/api-gateway/api_gateway.py ./api_gateway.py
+COPY services/api-gateway/dashboard.html ./dashboard.html
 
 RUN mkdir -p /data
 

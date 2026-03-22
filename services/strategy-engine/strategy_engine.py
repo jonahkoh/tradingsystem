@@ -36,6 +36,8 @@ SENTIMENT_CHANNEL = "sentiment_signals"
 TRADE_SIGNALS_CHANNEL = "trade_signals"
 ORDER_RESULTS_CHANNEL = "order_results"
 EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
+POSITION_CHANNEL = "position_updates"
+POSITION_KEY = "position:current"
 
 DEFAULT_SYMBOL = os.getenv("TRADE_SYMBOL", "BTC/USD")
 DEFAULT_ORDER_TYPE = "MARKET"
@@ -391,6 +393,22 @@ def handle_sentiment_update(raw_payload: str) -> None:
     )
 
 
+async def _publish_position_state(redis_client: aioredis.Redis) -> None:
+    profile = resolve_sd_profile(latest_sentiment_score)
+    snapshot = json.dumps({
+        "in_position": in_position,
+        "quantity": open_position_quantity,
+        "entry_price": entry_price,
+        "stop_loss_price": stop_loss_price,
+        "symbol": DEFAULT_SYMBOL,
+        "pending_action": pending_action,
+        "sentiment": profile["label"],
+        "timestamp": int(time.time()),
+    })
+    await redis_client.set(POSITION_KEY, snapshot)
+    await redis_client.publish(POSITION_CHANNEL, snapshot)
+
+
 async def consume_stream(redis_client: aioredis.Redis) -> None:
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
     await pubsub.subscribe(
@@ -431,6 +449,7 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
 
             if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
                 handle_execution_confirmation(payload)
+                await _publish_position_state(redis_client)
                 continue
 
             if channel != MARKET_DATA_CHANNEL:
@@ -497,9 +516,10 @@ async def run() -> None:
             )
             await redis_client.ping()
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
-            if not boot_liquidation_done:
-                await initialize_clean_slate(redis_client)
-                boot_liquidation_done = True
+            # TODO: re-enable once dashboard testing is complete
+            # if not boot_liquidation_done:
+            #     await initialize_clean_slate(redis_client)
+            #     boot_liquidation_done = True
             await consume_stream(redis_client)
         except aioredis.RedisError as exc:
             log.error("Redis error: %s. Retrying in %ds", exc, RETRY_DELAY_SEC)

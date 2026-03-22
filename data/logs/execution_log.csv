@@ -1,0 +1,2 @@
+Timestamp,Action,Pair,Price,Quantity,Requested_Qty,Effective_Qty,Strategy_Signal,API_Status
+2026-03-22 10:40:12,BUY,BTC/USD,68626.01000000,0.29140000,0.29140000,0.29140000,,200 SUCCESS

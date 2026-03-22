@@ -79,10 +79,13 @@ PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",   "1000000"))
 SOL_ALLOCATION   = float(os.getenv("SOL_ALLOCATION",  "0.20"))
 TARGET_ORDER_USD = PORTFOLIO_USD * SOL_ALLOCATION
 
-TRADING_FEE_RATE = float(os.getenv("TRADING_FEE_RATE",          "0.001"))
-POLL_TIMEOUT_SEC = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
-RETRY_DELAY_SEC  = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
-COOLDOWN_SECONDS = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",       "3600"))
+TRADING_FEE_RATE  = float(os.getenv("TRADING_FEE_RATE",            "0.001"))
+# Minimum price multiplier before death-cross exit fires — covers 0.2% round-trip fees + buffer.
+# Death cross at +0.14% still loses money after fees; this guard prevents that.
+MIN_SELL_MULTIPLIER = float(os.getenv("SOL_MIN_SELL_MULTIPLIER", "1.003"))
+POLL_TIMEOUT_SEC  = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
+RETRY_DELAY_SEC   = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
+COOLDOWN_SECONDS  = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",       "3600"))
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -355,22 +358,30 @@ async def evaluate_market_tick(
 
     # ── Exit 2: Death Cross (trend reversal) ──────────────────────────────────
     if death_cross:
-        sell_qty              = open_position_quantity
-        pending_action        = "SELL"
-        pending_sell_quantity = sell_qty
-        await _publish_signal(
-            redis_client,
-            action="SELL",
-            symbol=symbol,
-            quantity=sell_qty,
-            reason=f"Death_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}",
-            timestamp=timestamp,
-            expected_price=price,
-        )
-        log.info(
-            "Death cross exit: px=%.6f entry=%.6f pnl=%.2f%%",
-            price, entry_price, (price / entry_price - 1.0) * 100,
-        )
+        min_exit_price = entry_price * MIN_SELL_MULTIPLIER
+        if price < min_exit_price:
+            log.info(
+                "Death cross suppressed (fee guard): px=%.6f < min=%.6f (entry=%.6f × %.4f) pnl=%.2f%%",
+                price, min_exit_price, entry_price, MIN_SELL_MULTIPLIER,
+                (price / entry_price - 1.0) * 100,
+            )
+        else:
+            sell_qty              = open_position_quantity
+            pending_action        = "SELL"
+            pending_sell_quantity = sell_qty
+            await _publish_signal(
+                redis_client,
+                action="SELL",
+                symbol=symbol,
+                quantity=sell_qty,
+                reason=f"Death_Cross_fast{EMA_FAST_PERIOD}_slow{EMA_SLOW_PERIOD}",
+                timestamp=timestamp,
+                expected_price=price,
+            )
+            log.info(
+                "Death cross exit: px=%.6f entry=%.6f pnl=%.2f%%",
+                price, entry_price, (price / entry_price - 1.0) * 100,
+            )
         return
 
 

@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -51,10 +52,15 @@ EXECUTION_MIN_INTERVAL_SEC = float(os.getenv("EXECUTION_MIN_INTERVAL_SEC", "2.0"
 REQUEST_TIMEOUT_SEC = float(os.getenv("REQUEST_TIMEOUT_SEC", "10.0"))
 RETRY_DELAY_SEC = 5
 AUTH_DEBUG = os.getenv("AUTH_DEBUG", "false").lower() == "true"
+SELL_QTY_EPSILON = float(os.getenv("SELL_QTY_EPSILON", "0.00000001"))
+MIN_TRADABLE_QTY = float(os.getenv("MIN_TRADABLE_QTY", "0.000001"))
 
 SIGNALS_CHANNEL = "trade_signals"
 CONTROL_CHANNEL = "control"
 RESULTS_CHANNEL = "order_results"
+EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
+BALANCE_URL_PATH = "/v3/balance"
+CANCEL_ALL_ORDERS_PATH = "/v3/cancel_all_open_orders"
 
 
 logging.basicConfig(
@@ -104,11 +110,19 @@ def _validate_signal(signal_payload: dict[str, Any]) -> tuple[str, str, str, str
     if order_type not in {"MARKET", "LIMIT"}:
         raise ValueError(f"Unsupported order type: {order_type!r}")
 
+    if side == "SELL" and quantity.upper() == "ALL":
+        return side, pair, order_type, quantity
+
     parsed_qty = float(quantity)
     if parsed_qty <= 0:
         raise ValueError("quantity must be > 0")
 
     return side, pair, order_type, quantity
+
+
+def _floor_to_decimals(value: float, decimals: int) -> float:
+    scale = 10 ** decimals
+    return math.floor(max(value, 0.0) * scale) / scale
 
 
 class ExecutionThrottle:
@@ -148,6 +162,8 @@ def _build_order_result(
     side: str,
     pair: str,
     quantity: str,
+    requested_qty: float,
+    effective_qty: float,
     response_json: Any = None,
     raw_error: str = "",
 ) -> dict[str, Any]:
@@ -164,11 +180,122 @@ def _build_order_result(
         "order_id": order_id,
         "side": side,
         "symbol": pair,
-        "qty": float(quantity),
+        "qty": effective_qty,
+        "requested_qty": requested_qty,
+        "effective_qty": effective_qty,
         "price": 0.0,
         "order_details": order_details,
         "raw_error": raw_error,
     }
+
+
+def _extract_available_balance(response_json: Any, asset: str) -> float:
+    if not isinstance(response_json, dict):
+        return 0.0
+
+    candidates = response_json.get("Data")
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+
+    if not isinstance(candidates, list):
+        candidates = [response_json]
+
+    asset_upper = asset.upper()
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = str(item.get("Asset") or item.get("Coin") or item.get("Currency") or "").upper()
+        if symbol and symbol != asset_upper:
+            continue
+
+        available = item.get("Available")
+        if available is None:
+            available = item.get("Balance")
+        if available is None:
+            available = item.get("Free")
+        if available is None:
+            continue
+
+        try:
+            return float(available)
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
+
+
+def _get_available_base_balance(http_client: httpx.Client, pair: str) -> float:
+    base_asset = pair.split("/")[0].strip().upper()
+    timestamp = _current_ms()
+    params = {"timestamp": timestamp}
+    payload = _sorted_params_string(params)
+    signature = _sign_message(SECRET_KEY, payload)
+    headers = {
+        "RST-API-KEY": API_KEY,
+        "MSG-SIGNATURE": signature,
+    }
+
+    url = f"{ROOSTOO_BASE_URL}{BALANCE_URL_PATH}"
+    response = http_client.get(url, params={"timestamp": str(timestamp)}, headers=headers)
+
+    try:
+        response_json = response.json()
+    except ValueError:
+        response_json = None
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"balance lookup failed: {response.status_code} {response.text}")
+
+    return _extract_available_balance(response_json, base_asset)
+
+
+def _cancel_all_open_orders(http_client: httpx.Client, pair: str) -> None:
+    ts = _current_ms()
+    params = {"pair": pair, "timestamp": ts}
+    payload = _sorted_params_string(params)
+    sig = _sign_message(SECRET_KEY, payload)
+    headers = {
+        "RST-API-KEY": API_KEY,
+        "MSG-SIGNATURE": sig,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    url = f"{ROOSTOO_BASE_URL}{CANCEL_ALL_ORDERS_PATH}"
+    response = http_client.post(url, content=payload, headers=headers)
+    if response.status_code >= 400:
+        log.warning("cancel_all_open_orders returned %s: %s", response.status_code, response.text)
+
+
+def _extract_actual_fill_price(response_json: Any) -> float:
+    order_details = _extract_order_details(response_json)
+    if isinstance(order_details, dict):
+        for key in ("FilledAverPrice", "Price"):
+            value = order_details.get(key)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+    return 0.0
+
+
+def _publish_execution_confirmation(
+    redis_client: redis.Redis,
+    *,
+    signal_payload: dict[str, Any],
+    result_payload: dict[str, Any],
+) -> None:
+    confirmation = {
+        "action": str(signal_payload.get("action", "")).upper(),
+        "symbol": str(signal_payload.get("symbol", DEFAULT_PAIR)),
+        "reason": str(signal_payload.get("reason", "")),
+        "result": result_payload.get("result", "FAILED"),
+        "status_code": int(result_payload.get("status_code", 0)),
+        "requested_qty": float(result_payload.get("requested_qty", 0.0)),
+        "effective_qty": float(result_payload.get("effective_qty", 0.0)),
+        "timestamp": int(time.time()),
+    }
+    redis_client.publish(EXECUTION_CONFIRMATIONS_CHANNEL, json.dumps(confirmation))
 
 
 def execute_trade_signal(
@@ -179,6 +306,40 @@ def execute_trade_signal(
 ) -> dict[str, Any]:
     """Validate, sign, execute, and publish one trade signal."""
     side, pair, order_type, quantity = _validate_signal(signal_payload)
+    requested_qty = float(quantity) if quantity.upper() != "ALL" else -1.0
+    effective_qty = requested_qty
+
+    if side == "SELL":
+        available_qty = _get_available_base_balance(http_client, pair)
+        if quantity.upper() == "ALL":
+            effective_qty = max(available_qty - SELL_QTY_EPSILON, 0.0)
+            requested_qty = available_qty
+        else:
+            effective_qty = min(requested_qty, max(available_qty - SELL_QTY_EPSILON, 0.0))
+
+        effective_qty = _floor_to_decimals(effective_qty, 8)
+
+        if effective_qty < MIN_TRADABLE_QTY:
+            result = _build_order_result(
+                success=False,
+                status_code=400,
+                latency_ms=0,
+                side=side,
+                pair=pair,
+                quantity=f"{effective_qty:.8f}",
+                requested_qty=requested_qty,
+                effective_qty=effective_qty,
+                response_json=None,
+                raw_error=(
+                    "sell skipped: insufficient available balance after clamp "
+                    f"(requested={requested_qty:.8f}, available={available_qty:.8f})"
+                ),
+            )
+            redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
+            return result
+
+    effective_qty = _floor_to_decimals(effective_qty, 8)
+    quantity = f"{effective_qty:.8f}"
 
     params = {
         "pair": pair,
@@ -202,9 +363,15 @@ def execute_trade_signal(
 
     throttle.wait()
 
+    _cancel_all_open_orders(http_client, pair)
+
     url = f"{ROOSTOO_BASE_URL}/v3/place_order"
     start = time.perf_counter()
     response = http_client.post(url, content=payload, headers=headers)
+    if response.status_code == 429:
+        log.warning("HTTP 429 detected. Sleeping 0.5s and retrying once.")
+        time.sleep(0.5)
+        response = http_client.post(url, content=payload, headers=headers)
     latency_ms = int((time.perf_counter() - start) * 1000)
 
     try:
@@ -231,6 +398,17 @@ def execute_trade_signal(
                 )
             )
 
+    expected_price = float(signal_payload.get("expected_price", 0.0) or 0.0)
+    actual_fill_price = _extract_actual_fill_price(response_json)
+    if expected_price > 0.0 and actual_fill_price > 0.0:
+        slippage_pct = ((actual_fill_price - expected_price) / expected_price) * 100.0
+        log.info(
+            "Slippage | expected=%.8f actual=%.8f slippage_pct=%.5f",
+            expected_price,
+            actual_fill_price,
+            slippage_pct,
+        )
+
     result = _build_order_result(
         success=success,
         status_code=response.status_code,
@@ -238,6 +416,8 @@ def execute_trade_signal(
         side=side,
         pair=pair,
         quantity=quantity,
+        requested_qty=requested_qty,
+        effective_qty=effective_qty,
         response_json=response_json,
         raw_error=raw_error,
     )
@@ -284,6 +464,11 @@ def _handle_trade_message(
 
     try:
         result = execute_trade_signal(signal_payload, http_client, redis_client, throttle)
+        _publish_execution_confirmation(
+            redis_client,
+            signal_payload=signal_payload,
+            result_payload=result,
+        )
         log.info(
             "Order result published: result=%s status=%s latency_ms=%s",
             result["result"],
@@ -306,11 +491,18 @@ def _handle_trade_message(
             "side": str(signal_payload.get("action", "UNKNOWN")).upper(),
             "symbol": str(signal_payload.get("symbol", DEFAULT_PAIR)),
             "qty": safe_qty,
+            "requested_qty": safe_qty,
+            "effective_qty": safe_qty,
             "price": 0.0,
             "order_details": None,
             "raw_error": str(exc),
         }
         redis_client.publish(RESULTS_CHANNEL, json.dumps(fallback))
+        _publish_execution_confirmation(
+            redis_client,
+            signal_payload=signal_payload,
+            result_payload=fallback,
+        )
         log.error("Execution failure published to %s: %s", RESULTS_CHANNEL, exc)
 
 
@@ -345,6 +537,46 @@ def run() -> None:
                 )
                 r.ping()
                 log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
+
+                base_available = _get_available_base_balance(http_client, DEFAULT_PAIR)
+                if base_available > MIN_TRADABLE_QTY:
+                    log.warning(
+                        "Startup balance sync found leftover %.8f. Triggering emergency SELL ALL.",
+                        base_available,
+                    )
+                    startup_signal = {
+                        "action": "SELL",
+                        "symbol": DEFAULT_PAIR,
+                        "type": "MARKET",
+                        "quantity": "ALL",
+                        "reason": "STARTUP_BALANCE_SYNC",
+                    }
+                    startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
+                    _publish_execution_confirmation(
+                        r,
+                        signal_payload=startup_signal,
+                        result_payload=startup_result,
+                    )
+                else:
+                    startup_clear_signal = {
+                        "action": "SELL",
+                        "symbol": DEFAULT_PAIR,
+                        "type": "MARKET",
+                        "quantity": "0",
+                        "reason": "STARTUP_BALANCE_SYNC_CLEAR",
+                    }
+                    startup_clear_result = {
+                        "result": "SUCCESS",
+                        "status_code": 200,
+                        "requested_qty": 0.0,
+                        "effective_qty": 0.0,
+                    }
+                    _publish_execution_confirmation(
+                        r,
+                        signal_payload=startup_clear_signal,
+                        result_payload=startup_clear_result,
+                    )
+                    log.info("Startup balance sync clear: no leftover base asset.")
 
                 pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(SIGNALS_CHANNEL, CONTROL_CHANNEL)

@@ -323,7 +323,6 @@ def _compute_pnl(
             lots[pair].append([price, qty])
 
         elif action == "SELL":
-            sell_proceeds  = price * qty * (1 - fee_rate)
             remaining_qty  = qty
             matched_cost   = 0.0
 
@@ -340,6 +339,13 @@ def _compute_pnl(
                     lots[pair][0][1] -= remaining_qty
                     remaining_qty    = 0.0
 
+            # Only book PnL on the qty that had a matching BUY lot.
+            # Unmatched qty (remaining_qty > 0) means we sold a position opened
+            # before the CSV history — treating it as $0 cost would inflate PnL.
+            matched_qty      = qty - remaining_qty
+            if matched_qty <= 1e-8:
+                continue   # no matched lots — skip this SELL entirely
+            sell_proceeds    = price * matched_qty * (1 - fee_rate)
             trade_pnl        = sell_proceeds - matched_cost
             realized[pair]  += trade_pnl
 

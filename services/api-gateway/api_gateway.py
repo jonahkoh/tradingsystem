@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 load_dotenv()
 
@@ -36,6 +37,8 @@ CONTROL_CHANNEL = "control"
 MARKET_DATA_CHANNEL = "market_data"
 TRADE_SIGNALS_CHANNEL = "trade_signals"
 SENTIMENT_SIGNALS_CHANNEL = "sentiment_signals"
+POSITION_CHANNEL = "position_updates"
+POSITION_KEY = "position:current"
 
 BALANCE_URL = "https://mock-api.roostoo.com/v3/balance"
 CSV_FILE = Path(os.getenv("LOG_FILE", "logs/execution_log.csv"))
@@ -454,6 +457,30 @@ async def get_trades() -> list[dict[str, str]]:
     return _read_last_trades(CSV_FILE, limit=TRADES_LIMIT)
 
 
+@app.get("/api/position")
+async def get_position() -> Any:
+    redis_client: aioredis.Redis = app.state.redis
+    raw = await redis_client.get(POSITION_KEY)
+    if raw is None:
+        return {
+            "in_position": False,
+            "quantity": "0.0000",
+            "entry_price": 0.0,
+            "stop_loss_price": 0.0,
+            "symbol": "",
+            "pending_action": None,
+            "sentiment": "NEUTRAL",
+            "timestamp": 0,
+        }
+    return json.loads(raw)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    html_path = Path(__file__).parent / "dashboard.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -467,12 +494,14 @@ async def websocket_stream(websocket: WebSocket) -> None:
             MARKET_DATA_CHANNEL,
             TRADE_SIGNALS_CHANNEL,
             SENTIMENT_SIGNALS_CHANNEL,
+            POSITION_CHANNEL,
         )
         log.info(
-            "WebSocket subscribed to channels: %s, %s, %s",
+            "WebSocket subscribed to channels: %s, %s, %s, %s",
             MARKET_DATA_CHANNEL,
             TRADE_SIGNALS_CHANNEL,
             SENTIMENT_SIGNALS_CHANNEL,
+            POSITION_CHANNEL,
         )
 
         while True:
@@ -511,6 +540,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
                 MARKET_DATA_CHANNEL,
                 TRADE_SIGNALS_CHANNEL,
                 SENTIMENT_SIGNALS_CHANNEL,
+                POSITION_CHANNEL,
             )
         with suppress(Exception):
             await pubsub.aclose()

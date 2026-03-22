@@ -140,6 +140,125 @@ class ApiGatewayTests(unittest.TestCase):
             self.assertEqual(payload["channel"], "trade_signals")
             self.assertEqual(payload["data"], {"action": "BUY"})
 
+    # ── PnL tests (unit-test _compute_pnl directly — no HTTP, no Redis) ────────
+
+    def _write_csv(self, tmp_dir: str, rows: list[str]) -> Path:
+        csv_file = Path(tmp_dir) / "execution_log.csv"
+        header = "Timestamp,Action,Pair,Price,Quantity,Requested_Qty,Effective_Qty,Strategy_Signal,API_Status\n"
+        csv_file.write_text(header + "".join(rows), encoding="utf-8")
+        return csv_file
+
+    def test_pnl_no_trades_returns_zeros(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = Path(tmp) / "missing.csv"
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+        self.assertEqual(result["realized_pnl_usd"], 0.0)
+        self.assertEqual(result["total_closed_trades"], 0)
+        self.assertEqual(result["per_symbol"], {})
+
+    def test_pnl_single_winning_round_trip(self):
+        """BUY at 100 → SELL at 110: net PnL should be positive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,BUY,BTC/USD,100.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 01:00:00,SELL,BTC/USD,110.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        # sell_proceeds = 110 × (1 - 0.001) = 109.89
+        # buy_cost      = 100 × (1 + 0.001) = 100.10
+        # pnl           = 9.79
+        self.assertGreater(result["realized_pnl_usd"], 0)
+        self.assertEqual(result["winning_trades"], 1)
+        self.assertEqual(result["losing_trades"], 0)
+        self.assertEqual(result["total_closed_trades"], 1)
+        self.assertAlmostEqual(result["realized_pnl_usd"], 9.78, places=1)
+
+    def test_pnl_single_losing_round_trip(self):
+        """BUY at 100 → SELL at 90: net PnL should be negative."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,BUY,BTC/USD,100.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 01:00:00,SELL,BTC/USD,90.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        self.assertLess(result["realized_pnl_usd"], 0)
+        self.assertEqual(result["winning_trades"], 0)
+        self.assertEqual(result["losing_trades"], 1)
+
+    def test_pnl_fifo_lot_matching(self):
+        """Two BUYs at different prices: FIFO means the first BUY is matched first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,BUY,BTC/USD,100.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 00:01:00,BUY,BTC/USD,200.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 01:00:00,SELL,BTC/USD,150.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        # SELL matches the first BUY (100 → 150): winning trade.
+        self.assertEqual(result["winning_trades"], 1)
+        # Second BUY at 200 remains as an open lot.
+        btc = result["per_symbol"]["BTC/USD"]
+        self.assertEqual(len(btc["open_lots"]), 1)
+        self.assertAlmostEqual(btc["open_lots"][0]["price"], 200.0, places=4)
+
+    def test_pnl_skips_failed_rows(self):
+        """Only SUCCESS rows contribute to PnL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,BUY,BTC/USD,100.0,1.0,1.0,1.0,alpha,400 FAILED\n",
+                "2026-01-01 01:00:00,SELL,BTC/USD,110.0,1.0,1.0,1.0,alpha,400 FAILED\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        self.assertEqual(result["realized_pnl_usd"], 0.0)
+        self.assertEqual(result["total_closed_trades"], 0)
+
+    def test_pnl_skips_startup_liquidation_rows(self):
+        """SYSTEM_REBOOT_LIQUIDATION rows must be excluded from PnL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,SELL,BTC/USD,100.0,1.0,1.0,1.0,SYSTEM_REBOOT_LIQUIDATION,200 SUCCESS\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        self.assertEqual(result["total_closed_trades"], 0)
+        self.assertEqual(result["per_symbol"], {})
+
+    def test_pnl_multi_symbol(self):
+        """PnL is tracked independently per symbol."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_file = self._write_csv(tmp, [
+                "2026-01-01 00:00:00,BUY,BTC/USD,100.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 00:00:00,BUY,XRP/USD,1.0,100.0,100.0,100.0,beta,200 SUCCESS\n",
+                "2026-01-01 01:00:00,SELL,BTC/USD,110.0,1.0,1.0,1.0,alpha,200 SUCCESS\n",
+                "2026-01-01 01:00:00,SELL,XRP/USD,0.9,100.0,100.0,100.0,beta,200 SUCCESS\n",
+            ])
+            result = api_gateway._compute_pnl(csv_file, fee_rate=0.001)
+
+        self.assertIn("BTC/USD", result["per_symbol"])
+        self.assertIn("XRP/USD", result["per_symbol"])
+        self.assertGreater(result["per_symbol"]["BTC/USD"]["realized_pnl_usd"], 0)
+        self.assertLess(result["per_symbol"]["XRP/USD"]["realized_pnl_usd"], 0)
+
+    def test_pnl_endpoint_returns_200(self):
+        """GET /api/pnl returns 200 with expected keys even when no CSV exists."""
+        original_csv = api_gateway.CSV_FILE
+        api_gateway.CSV_FILE = Path("/tmp/nonexistent_log.csv")
+        try:
+            with TestClient(api_gateway.app) as client:
+                resp = client.get("/api/pnl")
+        finally:
+            api_gateway.CSV_FILE = original_csv
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("realized_pnl_usd", body)
+        self.assertIn("per_symbol", body)
+        self.assertIn("total_closed_trades", body)
+
     @patch.object(api_gateway.httpx, "AsyncClient")
     def test_balance_endpoint_signs_request(self, async_client_cls):
         captured_kwargs = {}

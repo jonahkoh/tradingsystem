@@ -1,0 +1,3 @@
+Timestamp,Action,Pair,Price,Quantity,Requested_Qty,Effective_Qty,Strategy_Signal,API_Status
+2026-03-22 07:35:52,SELL,BTCUSDT,0.00000000,0.28840000,0.28840000,0.28840000,,200 trade pair not found
+2026-03-22 07:35:52,SELL,SOL/USD,0.00000000,0.00000000,0.00000000,0.00000000,,"400 sell skipped: insufficient available balance after clamp (requested=0.00000000, available=0.00000000, locked=0.00000000)"

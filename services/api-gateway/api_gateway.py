@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -40,6 +41,15 @@ BALANCE_URL = "https://mock-api.roostoo.com/v3/balance"
 CSV_FILE = Path(os.getenv("LOG_FILE", "logs/execution_log.csv"))
 TRADES_LIMIT = 50
 
+TRADING_FEE_RATE = float(os.getenv("TRADING_FEE_RATE", "0.001"))
+
+# Signals written by the startup liquidation routine — excluded from PnL.
+_STARTUP_SIGNALS = {
+    "SYSTEM_REBOOT_LIQUIDATION",
+    "STARTUP_BALANCE_SYNC",
+    "STARTUP_BALANCE_SYNC_CLEAR",
+}
+
 EXPECTED_TRADE_HEADERS = [
     "Timestamp",
     "Action",
@@ -72,6 +82,38 @@ app.add_middleware(
 )
 
 
+async def _watch_prices() -> None:
+    """Background task: subscribe to market_data and cache the latest price per symbol."""
+    while True:
+        redis_client: aioredis.Redis | None = None
+        try:
+            redis_client = aioredis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+            pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+            await pubsub.subscribe(MARKET_DATA_CHANNEL)
+            log.info("Price watcher subscribed to %s", MARKET_DATA_CHANNEL)
+            while True:
+                msg = await pubsub.get_message(timeout=1.0)
+                if msg and msg.get("type") == "message":
+                    with suppress(Exception):
+                        tick = json.loads(msg["data"])
+                        sym  = tick.get("symbol")
+                        px   = float(tick.get("mid_price", 0))
+                        if sym and px > 0:
+                            app.state.latest_prices[sym] = px
+        except Exception as exc:
+            log.warning("Price watcher error: %s — retrying in 5s.", exc)
+        finally:
+            with suppress(Exception):
+                if redis_client is not None:
+                    await redis_client.aclose()
+        await asyncio.sleep(5)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     app.state.redis = aioredis.Redis(
@@ -80,6 +122,8 @@ async def on_startup() -> None:
         decode_responses=True,
         socket_connect_timeout=5,
     )
+    app.state.latest_prices: dict[str, float] = {}
+    asyncio.create_task(_watch_prices())
     log.info("API Gateway online. Redis target %s:%s", REDIS_HOST, REDIS_PORT)
 
 
@@ -198,6 +242,205 @@ async def get_balance() -> Any:
         raise HTTPException(status_code=response.status_code, detail=payload)
 
     return payload
+
+
+def _compute_pnl(
+    csv_file: Path,
+    fee_rate: float = TRADING_FEE_RATE,
+    latest_prices: dict[str, float] | None = None,
+) -> dict:
+    """
+    Read the full execution log and compute realized PnL using FIFO lot matching.
+
+    For each symbol:
+      - BUY rows open a new lot (price, qty).
+      - SELL rows consume the oldest lots first (FIFO), realising PnL per lot consumed.
+      - Both sides pay `fee_rate` on the notional, so:
+          buy_cost     = price × qty × (1 + fee_rate)
+          sell_proceed = price × qty × (1 - fee_rate)
+
+    Startup-liquidation rows (SYSTEM_REBOOT_LIQUIDATION etc.) are excluded.
+    Only rows whose API_Status contains "SUCCESS" are counted.
+    """
+    if not csv_file.exists():
+        return {
+            "realized_pnl_usd": 0.0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "breakeven_trades": 0,
+            "total_closed_trades": 0,
+            "fee_rate": fee_rate,
+            "per_symbol": {},
+        }
+
+    try:
+        with csv_file.open("r", newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError as exc:
+        log.error("Failed reading trades CSV for PnL: %s", exc)
+        raise HTTPException(status_code=500, detail="Unable to read trades log") from exc
+
+    # Per-symbol FIFO lot queues: deque of [price, remaining_qty]
+    lots:         dict[str, deque] = {}
+    realized:     dict[str, float] = {}
+    winning:      dict[str, int]   = {}
+    losing:       dict[str, int]   = {}
+    breakeven:    dict[str, int]   = {}
+
+    for row in rows:
+        if "SUCCESS" not in row.get("API_Status", ""):
+            continue
+
+        signal = row.get("Strategy_Signal", "").upper()
+        if signal in _STARTUP_SIGNALS:
+            continue
+
+        action = row.get("Action", "").upper()
+        if action not in {"BUY", "SELL"}:
+            continue
+
+        pair = row.get("Pair", "UNKNOWN")
+
+        try:
+            price = float(row.get("Price") or 0)
+            # Prefer Effective_Qty (actual fill); fall back to Quantity.
+            qty   = float(row.get("Effective_Qty") or row.get("Quantity") or 0)
+        except (ValueError, TypeError):
+            continue
+
+        if price <= 0 or qty <= 0:
+            continue
+
+        # Initialise per-symbol accumulators on first encounter.
+        if pair not in lots:
+            lots[pair]      = deque()
+            realized[pair]  = 0.0
+            winning[pair]   = 0
+            losing[pair]    = 0
+            breakeven[pair] = 0
+
+        if action == "BUY":
+            lots[pair].append([price, qty])
+
+        elif action == "SELL":
+            sell_proceeds  = price * qty * (1 - fee_rate)
+            remaining_qty  = qty
+            matched_cost   = 0.0
+
+            while remaining_qty > 1e-8 and lots[pair]:
+                buy_price, buy_qty = lots[pair][0]
+                if buy_qty <= remaining_qty + 1e-8:
+                    # Consume the whole lot.
+                    matched_cost  += buy_price * buy_qty * (1 + fee_rate)
+                    remaining_qty -= buy_qty
+                    lots[pair].popleft()
+                else:
+                    # Partially consume.
+                    matched_cost  += buy_price * remaining_qty * (1 + fee_rate)
+                    lots[pair][0][1] -= remaining_qty
+                    remaining_qty    = 0.0
+
+            trade_pnl        = sell_proceeds - matched_cost
+            realized[pair]  += trade_pnl
+
+            if trade_pnl > 0.01:
+                winning[pair]   += 1
+            elif trade_pnl < -0.01:
+                losing[pair]    += 1
+            else:
+                breakeven[pair] += 1
+
+    prices = latest_prices or {}
+
+    # Aggregate across symbols.
+    total_realized   = 0.0
+    total_unrealized = 0.0
+    total_winning    = 0
+    total_losing     = 0
+    total_breakeven  = 0
+    per_symbol: dict[str, dict] = {}
+
+    for sym in sorted(realized):
+        pnl = realized[sym]
+        w   = winning[sym]
+        l   = losing[sym]
+        b   = breakeven[sym]
+
+        total_realized  += pnl
+        total_winning   += w
+        total_losing    += l
+        total_breakeven += b
+
+        open_lots_list = [
+            {"price": round(p, 8), "qty": round(q, 8)}
+            for p, q in lots.get(sym, [])
+        ]
+        open_qty  = sum(q for _, q in lots.get(sym, []))
+        open_cost = sum(p * q * (1 + fee_rate) for p, q in lots.get(sym, []))
+
+        # Unrealized PnL: what we'd receive selling now minus what we paid.
+        current_price = prices.get(sym)
+        if current_price and open_qty > 0:
+            current_value    = current_price * open_qty * (1 - fee_rate)
+            unrealized_pnl   = current_value - open_cost
+            total_unrealized += unrealized_pnl
+            sym_entry: dict[str, Any] = {
+                "realized_pnl_usd":    round(pnl, 2),
+                "unrealized_pnl_usd":  round(unrealized_pnl, 2),
+                "winning_trades":      w,
+                "losing_trades":       l,
+                "breakeven_trades":    b,
+                "open_lots":           open_lots_list,
+                "open_qty":            round(open_qty, 8),
+                "open_cost_basis_usd": round(open_cost, 2),
+                "current_price":       round(current_price, 8),
+            }
+        else:
+            sym_entry = {
+                "realized_pnl_usd":    round(pnl, 2),
+                "unrealized_pnl_usd":  None,   # price not yet received
+                "winning_trades":      w,
+                "losing_trades":       l,
+                "breakeven_trades":    b,
+                "open_lots":           open_lots_list,
+                "open_qty":            round(open_qty, 8),
+                "open_cost_basis_usd": round(open_cost, 2),
+                "current_price":       None,
+            }
+
+        per_symbol[sym] = sym_entry
+
+    return {
+        "realized_pnl_usd":    round(total_realized, 2),
+        "unrealized_pnl_usd":  round(total_unrealized, 2),
+        "total_pnl_usd":       round(total_realized + total_unrealized, 2),
+        "winning_trades":      total_winning,
+        "losing_trades":       total_losing,
+        "breakeven_trades":    total_breakeven,
+        "total_closed_trades": total_winning + total_losing + total_breakeven,
+        "fee_rate":            fee_rate,
+        "per_symbol":          per_symbol,
+    }
+
+
+@app.get("/api/pnl")
+async def get_pnl() -> dict:
+    """
+    Compute realized PnL from the execution log using FIFO lot matching.
+
+    Returns:
+      - realized_pnl_usd: total profit/loss across all closed positions
+      - winning/losing/breakeven_trades: round-trip trade counts
+      - per_symbol: per-asset breakdown with open lot details
+    """
+    try:
+        latest_prices: dict[str, float] = getattr(app.state, "latest_prices", {})
+        return _compute_pnl(CSV_FILE, latest_prices=latest_prices)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("PnL computation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="PnL computation failed") from exc
 
 
 @app.get("/api/trades")

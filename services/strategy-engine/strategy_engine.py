@@ -51,6 +51,7 @@ RETRY_DELAY_SEC = int(os.getenv("STRATEGY_RETRY_DELAY_SEC", "5"))
 TRADING_FEE_RATE = float(os.getenv("TRADING_FEE_RATE", "0.001"))
 MIN_SELL_MULTIPLIER = float(os.getenv("MIN_SELL_MULTIPLIER", "1.0025"))
 STOP_LOSS_MULTIPLIER = float(os.getenv("STOP_LOSS_MULTIPLIER", "0.97"))
+COOLDOWN_SECONDS = int(os.getenv("STOP_LOSS_COOLDOWN_SEC", "3600"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +75,10 @@ open_position_quantity = "0.0000"
 pending_action: str | None = None
 entry_price = 0.0
 stop_loss_price = 0.0
+cooldown_until = 0.0
+boot_liquidation_done = False
+pending_sell_quantity = "0.0000"
+boot_liquidation_pending = False
 
 
 def _handle_shutdown(signum, frame):  # noqa: ANN001
@@ -139,7 +144,7 @@ async def publish_signal(
 
 
 async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_client: aioredis.Redis) -> None:
-    global pending_action, entry_price, stop_loss_price
+    global pending_action, in_position, open_position_quantity, entry_price, stop_loss_price, cooldown_until, pending_sell_quantity, boot_liquidation_pending
     prices.append(price)
     if len(prices) < WINDOW_PERIOD:
         log.info(
@@ -171,8 +176,21 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
         log.info("Signal suppressed while awaiting %s fill confirmation.", pending_action)
         return
 
-    if not in_position and price < dynamic_lower:
+    if boot_liquidation_pending:
+        log.info("Waiting for startup liquidation result before processing new entries.")
+        return
+
+    now_ts = time.time()
+
+    # Cancel cooldown early if market has already recovered above mean.
+    if cooldown_until > now_ts and price > sma:
+        cooldown_until = 0.0
+        log.info("Market recovered above SMA. Cooldown canceled.")
+
+    if not in_position and now_ts > cooldown_until and price < dynamic_lower:
         pending_action = "BUY"
+        in_position = True
+        open_position_quantity = quantity
         entry_price = price
         stop_loss_price = entry_price * STOP_LOSS_MULTIPLIER
         await publish_signal(
@@ -187,26 +205,34 @@ async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_
 
     if in_position and price <= stop_loss_price:
         pending_action = "SELL"
+        sell_qty = open_position_quantity
+        pending_sell_quantity = sell_qty
+        in_position = False
         await publish_signal(
             redis_client,
             action="SELL",
             symbol=symbol,
-            quantity=open_position_quantity,
+            quantity=sell_qty,
             reason="Stop_Loss_3pct",
             timestamp=timestamp,
         )
+        cooldown_until = now_ts + COOLDOWN_SECONDS
         log.warning("Stop-Loss triggered at -3%%.")
+        log.info("Stop-Loss hit. Entering %ds cooldown.", COOLDOWN_SECONDS)
         return
 
     if in_position and price >= sma:
         minimum_sell_price = entry_price * MIN_SELL_MULTIPLIER
         if price >= minimum_sell_price:
             pending_action = "SELL"
+            in_position = False
+            sell_qty = open_position_quantity
+            pending_sell_quantity = sell_qty
             await publish_signal(
                 redis_client,
                 action="SELL",
                 symbol=symbol,
-                quantity=open_position_quantity,
+                quantity=sell_qty,
                 reason="Mean_Reversion_TP",
                 timestamp=timestamp,
             )
@@ -238,7 +264,7 @@ def _extract_executed_quantity(order_result: dict[str, Any]) -> float:
 
 
 def handle_order_result_update(raw_payload: str) -> None:
-    global in_position, open_position_quantity, pending_action, entry_price, stop_loss_price
+    global in_position, open_position_quantity, pending_action, entry_price, stop_loss_price, pending_sell_quantity, boot_liquidation_pending
     try:
         data = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
@@ -251,12 +277,38 @@ def handle_order_result_update(raw_payload: str) -> None:
     if side not in {"BUY", "SELL"}:
         return
 
+    if boot_liquidation_pending and side == "SELL":
+        boot_liquidation_pending = False
+        pending_action = None
+        pending_sell_quantity = "0.0000"
+        in_position = False
+        open_position_quantity = "0.0000"
+        entry_price = 0.0
+        stop_loss_price = 0.0
+        log.info("Startup liquidation cycle completed with result=%s", result)
+        return
+
+    if pending_action is None:
+        # Ignore fills that were not initiated by this strategy loop.
+        return
+
+    if side != pending_action:
+        log.info("Ignoring out-of-order fill event side=%s while pending=%s", side, pending_action)
+        return
+
     if result != "SUCCESS":
         if pending_action == side:
             log.info("%s failed, clearing pending action.", side)
             if side == "BUY":
+                in_position = False
+                open_position_quantity = "0.0000"
                 entry_price = 0.0
                 stop_loss_price = 0.0
+            if side == "SELL":
+                in_position = True
+                if open_position_quantity in {"", "0", "0.0", "0.0000"}:
+                    open_position_quantity = pending_sell_quantity
+            pending_sell_quantity = "0.0000"
             pending_action = None
         return
 
@@ -266,6 +318,7 @@ def handle_order_result_update(raw_payload: str) -> None:
         net_qty = max(executed_qty * (1.0 - TRADING_FEE_RATE), 0.0)
         in_position = net_qty > 0
         open_position_quantity = f"{net_qty:.4f}"
+        pending_sell_quantity = "0.0000"
         pending_action = None
         log.info(
             "BUY fill confirmed: executed=%.8f, fee_rate=%.4f, net_position=%s",
@@ -284,6 +337,7 @@ def handle_order_result_update(raw_payload: str) -> None:
         remaining = max(current_qty - executed_qty, 0.0)
         in_position = remaining > 0
         open_position_quantity = f"{remaining:.4f}"
+        pending_sell_quantity = "0.0000"
         if remaining <= 0.0:
             entry_price = 0.0
             stop_loss_price = 0.0
@@ -364,7 +418,29 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
         await pubsub.aclose()
 
 
+async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
+    global in_position, open_position_quantity, pending_action, entry_price, stop_loss_price, cooldown_until, pending_sell_quantity, boot_liquidation_pending
+    payload = {
+        "action": "SELL",
+        "symbol": DEFAULT_SYMBOL,
+        "type": DEFAULT_ORDER_TYPE,
+        "quantity": "ALL",
+        "reason": "SYSTEM_REBOOT_LIQUIDATION",
+    }
+    await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
+    boot_liquidation_pending = True
+    in_position = False
+    open_position_quantity = "0.0000"
+    pending_action = "SELL"
+    entry_price = 0.0
+    stop_loss_price = 0.0
+    cooldown_until = 0.0
+    pending_sell_quantity = "0.0000"
+    log.info("Startup clean-slate liquidation signal published.")
+
+
 async def run() -> None:
+    global boot_liquidation_done
     log.info(
         "Strategy engine starting | window=%d | target_notional=$%.2f | default_sentiment=%.2f",
         WINDOW_PERIOD,
@@ -383,6 +459,9 @@ async def run() -> None:
             )
             await redis_client.ping()
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
+            if not boot_liquidation_done:
+                await initialize_clean_slate(redis_client)
+                boot_liquidation_done = True
             await consume_stream(redis_client)
         except aioredis.RedisError as exc:
             log.error("Redis error: %s. Retrying in %ds", exc, RETRY_DELAY_SEC)

@@ -67,29 +67,39 @@ class SentimentServiceTests(unittest.TestCase):
 
     @patch.object(sentiment_service, "fetch_recent_headlines")
     def test_run_once_publishes_payload(self, fetch_mock):
+        # Headlines have no XRP keywords → XRP channel gets neutral (0.0) default.
         fetch_mock.return_value = ["Bitcoin drops as regulations tighten", "Altcoins slip"]
 
         redis_stub = _RedisStub()
         analyzer = _AnalyzerStub([-0.7, -0.3])
 
-        payload = sentiment_service.run_once(
+        # run_once returns None; side effects are the two publish calls.
+        result = sentiment_service.run_once(
             redis_client=redis_stub,
             analyzer=analyzer,
             feed_urls=["https://a"],
             max_headlines=2,
         )
+        self.assertIsNone(result)
 
-        self.assertEqual(payload["status"], "SEVERE_FEAR")
-        self.assertEqual(payload["latest_headline"], "Bitcoin drops as regulations tighten")
-        self.assertIsInstance(payload["compound_score"], float)
+        # Expect two messages: global channel first, XRP channel second.
+        self.assertEqual(len(redis_stub.messages), 2)
 
-        self.assertEqual(len(redis_stub.messages), 1)
+        # ── Global sentiment ────────────────────────────────────────────────
         channel, raw_payload = redis_stub.messages[0]
         self.assertEqual(channel, sentiment_service.SENTIMENT_CHANNEL)
-
         data = json.loads(raw_payload)
-        self.assertIn("compound_score", data)
+        self.assertEqual(data["status"], "SEVERE_FEAR")
+        self.assertEqual(data["latest_headline"], "Bitcoin drops as regulations tighten")
         self.assertIsInstance(data["compound_score"], float)
+        self.assertEqual(data["coin"], "GLOBAL")
+
+        # ── XRP sentiment (no matching headlines → neutral default) ─────────
+        xrp_channel, xrp_raw = redis_stub.messages[1]
+        self.assertEqual(xrp_channel, sentiment_service.XRP_SENTIMENT_CHANNEL)
+        xrp_data = json.loads(xrp_raw)
+        self.assertEqual(xrp_data["compound_score"], 0.0)
+        self.assertEqual(xrp_data["coin"], "XRP")
 
 
 if __name__ == "__main__":

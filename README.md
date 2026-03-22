@@ -1,145 +1,99 @@
 # tradingsystem
 
-Lightweight crypto trading pipeline using Binance Spot Testnet, Redis Pub/Sub, and Python microservices.
+Lightweight crypto trading pipeline using Roostoo Mock Exchange, Redis Pub/Sub, and Python microservices.
 
-## System Design
+## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         External Services                           │
-│                                                                     │
-│   Binance WebSocket                    Binance Testnet REST         │
-│   stream.binance.com                   testnet.binance.vision       │
-│   btcusdt@bookTicker                   /api/v3/order                │
-│   (real production prices)             (paper trading)              │
-└────────────┬───────────────────────────────────▲────────────────────┘
-             │ WebSocket stream                   │ POST order
-             ▼                                   │
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Docker Network — tradingsystem_net               │
-│                                                                     │
-│  ┌─────────────────┐   market_data    ┌──────────────────────────┐ │
-│  │  [A] Feed       │ ───────────────► │  [B] Strategy Engine     │ │
-│  │  Handler        │                  │                          │ │
-│  │                 │                  │  Rolling MA crossover    │ │
-│  │  Throttles WS   │   market_data    │  Fast: 7 ticks           │ │
-│  │  ticks → 1/s    │ ───────────────► │  Slow: 25 ticks          │ │
-│  │  Publishes      │  (unrealized     │                          │ │
-│  │  mid-price      │   PnL feed)      │  Emits BUY / SELL only   │ │
-│  └─────────────────┘                  └────────────┬─────────────┘ │
-│                                                    │ trade_signals  │
-│                                                    ▼               │
-│  ┌─────────────────┐   control        ┌──────────────────────────┐ │
-│  │  [E] API        │ ───────────────► │  [C] Execution Manager   │ │
-│  │  Gateway        │                  │                          │ │
-│  │                 │                  │  Dynamic sizing (1% risk) │ │
-│  │  FastAPI :8000  │                  │  Places MARKET orders    │ ├─┘
-│  │                 │                  │  Handles HALT command    │
-│  │  GET  /health   │                  └────────────┬─────────────┘
-│  │  GET  /status   │                               │ order_results
-│  │  GET  /pnl      │                               ▼
-│  │  GET  /trades   │                  ┌──────────────────────────┐
-│  │  POST /kill     │                  │  [D] Ledger & Risk       │
-│  │                 │                  │  Monitor                 │
-│  └────────┬────────┘                  │                          │
-│           │                           │  Tracks position + PnL   │
-│           │  reads                    │  Weighted avg entry      │
-│           │◄──────────────────────────┤  Realized + unrealized   │
-│           │                           │  Restores state on boot  │
-│           │                           └────────────┬─────────────┘
-│           │                                        │ writes
-│           │                                        ▼
-│           │                           ┌──────────────────────────┐
-│           └──────────────────────────►│  ./data/  (host volume)  │
-│                      reads            │                          │
-│                                       │  trades.db  (SQLite)     │
-│                                       │  trades.log (flat file)  │
-│                                       └──────────────────────────┘
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Redis (Pub/Sub broker)                                     │   │
-│  │                                                             │   │
-│  │  market_data   · trade_signals   · order_results · control  │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-                              ▲
-                              │  curl / Postman / Browser
-                          👤 Operator
-```
+Services run in one Docker network and communicate through Redis channels.
 
-### Redis channels
+- Process A: Feed Handler
+- Process B: Strategy Engine (Sentiment-Adjusted Mean Reversion)
+- Process C: Execution Manager (Roostoo signed orders)
+- Process D: Ledger Service (durable CSV audit log)
+- Process E: API Gateway (control + reporting + websocket stream)
+- Process F: Sentiment Oracle (RSS + VADER scoring)
 
-| Channel          | Publisher          | Subscriber(s)          | Payload                          |
-|------------------|--------------------|------------------------|----------------------------------|
-| `market_data`    | Feed Handler       | Strategy Engine, Ledger | `{symbol, mid_price, timestamp}` |
-| `trade_signals`  | Strategy Engine    | Execution Manager      | `{action, symbol, type}`         |
-| `order_results`  | Execution Manager  | Ledger                 | `{order_id, side, price, qty, result}` |
-| `control`        | API Gateway        | Execution Manager      | `{command: "HALT"|"START"}`      |
+## Redis Channels
 
-### Services
+| Channel | Publisher | Subscriber(s) | Purpose |
+|---|---|---|---|
+| market_data | Feed Handler | Strategy Engine, API Gateway | Mid-price snapshots |
+| sentiment_signals | Sentiment Oracle | Strategy Engine, API Gateway | NLP compound sentiment score |
+| trade_signals | Strategy Engine | Execution Manager, API Gateway | BUY/SELL instructions |
+| order_results | Execution Manager | Ledger, API Gateway | Execution outcomes |
+| control | API Gateway | Execution Manager | HALT/START control |
 
-| File                                      | Process | Role                                              |
-|-------------------------------------------|---------|---------------------------------------------------|
-| `services/feed-handler/feed-handler.py`   | A       | Streams live BTC prices from Binance WebSocket    |
-| `services/strategy-engine/strategy-engine.py` | B   | MA crossover signals (7 vs 25 window)             |
-| `services/execution-manager/execution.py` | C       | Places orders on Binance Testnet, HALT/START control |
-| `services/ledger/ledger.py`               | D       | Tracks position, PnL, persists fills to SQLite    |
-| `services/api-gateway/api_gateway.py`     | E       | HTTP control plane — kill switch + PnL endpoints  |
+## Service Files
 
-### External dependencies
-
-| Service                       | Used by            | Purpose                         |
-|-------------------------------|--------------------|---------------------------------|
-| Binance WebSocket (prod)      | Feed Handler       | Real-time BTC order book feed   |
-| Binance Testnet REST          | Execution Manager  | Paper trading order execution   |
-
----
+| Process | Main File |
+|---|---|
+| A | services/feed-handler/market_data.py |
+| B | services/strategy-engine/strategy_engine.py |
+| C | services/execution-manager/execution_service.py |
+| D | services/ledger/ledger_service.py |
+| E | services/api-gateway/api_gateway.py |
+| F | services/sentiment-oracle/sentiment_service.py |
 
 ## Quick Start
 
 ### Prerequisites
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- Python 3.11+
 
-### 1 — Clone & configure
+- Docker Desktop
+- Python 3.11+ (optional for local test runs)
+
+### 1) Configure env
+
+Copy .env.example to .env and fill in credentials:
+
+- API_KEY
+- SECRET_KEY
+- ROOSTOO_BASE_URL (default https://mock-api.roostoo.com)
+
+### 2) Build and run
+
 ```bash
-git clone https://github.com/jonahkoh/tradingsystem.git
-cd tradingsystem
-cp .env.example .env
-# Edit .env and paste your Binance Testnet API key + secret
-# Get keys at: https://testnet.binance.vision/
+docker compose up -d --build
 ```
 
-### 2 — Start all services
+### 3) Basic health checks
+
 ```bash
-docker compose up -d
+docker compose ps
+docker compose logs --tail=80 api-gateway
+docker compose logs --tail=80 sentiment-oracle
 ```
 
-### 3 — Verify the stack is healthy
-```bash
-python test_setup.py
-```
-All 5 checks should print `[PASS]`.
+## API Gateway
 
----
+Base URL: http://localhost:8000
 
-## API Endpoints
+### HTTP Endpoints
 
-| Method | Endpoint   | Description                              |
-|--------|------------|------------------------------------------|
-| GET    | `/health`  | Liveness probe                           |
-| GET    | `/status`  | Kill switch state this session           |
-| GET    | `/pnl`     | Current PnL summary from SQLite          |
-| GET    | `/trades`  | Recent fills (`?limit=N`, default 100)   |
-| POST   | `/kill`    | Emergency halt — cancels all open orders |
-| POST   | `/start-again` | Resume execution after HALT          |
+- GET /health
+- POST /api/kill
+- POST /api/resume
+- GET /api/balance
+- GET /api/trades
 
-Interactive docs available at `http://localhost:8000/docs`.
+### WebSocket
 
----
+- WS /ws/stream
+
+Streams live events from:
+
+- market_data
+- trade_signals
+- sentiment_signals
+
+## Data Persistence
+
+Ledger writes a durable CSV audit file to:
+
+- data/logs/execution_log.csv
+
+The active runtime no longer uses SQLite trades.db.
 
 ## Notes
-- All trading is on **Binance Spot Testnet** — no real funds are used.
-- Never commit your `.env` file. It is listed in `.gitignore`.
-- PnL state persists across restarts via `./data/trades.db`.
-- To stop all services: `docker compose down`
+
+- Use 127.0.0.1 for local websocket testing if localhost is unstable in your client.
+- If port 6379 is already in use, stop the conflicting Redis container before starting this stack.

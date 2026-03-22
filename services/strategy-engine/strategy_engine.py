@@ -1,26 +1,16 @@
-"""
-Process B — Strategy Engine (Volatility-Filtered Mean Reversion)
-=================================================================
-Subscribes to Redis `market_data` and publishes trade signals to `trade_signals`.
+"""Process B - Strategy Engine (Sentiment-Adjusted Mean Reversion).
 
-Trading logic:
-  BUY  when OUT_OF_POSITION and:
-      price < lower Bollinger Band
-      AND volatility (ATR proxy / price) <= MAX_VOL_THRESHOLD
+Subscribes to:
+    - market_data: latest mid_price ticks
+    - sentiment_signals: latest NLP compound_score
 
-  SELL (take profit) when IN_POSITION and:
-      price >= Bollinger middle band (SMA)
-
-  SELL (emergency stop) when IN_POSITION and:
-      price < (entry_price - 1.5 * ATR proxy)
-
-No-HFT behavior:
-  - Signals only fire on state transitions (IN/OUT position).
-  - Optional cooldown guard between signal publishes.
+Publishes trade signals to trade_signals using dynamic lower-band thresholds and
+USD-notional position sizing.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -29,38 +19,39 @@ import signal
 import sys
 import time
 from collections import deque
+from typing import Any
 
-import redis
+import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-IN_CHANNEL = "market_data"
-OUT_CHANNEL = "trade_signals"
+MARKET_DATA_CHANNEL = "market_data"
+SENTIMENT_CHANNEL = "sentiment_signals"
+TRADE_SIGNALS_CHANNEL = "trade_signals"
+ORDER_RESULTS_CHANNEL = "order_results"
 
 DEFAULT_SYMBOL = os.getenv("TRADE_SYMBOL", "BTC/USD")
+DEFAULT_ORDER_TYPE = "MARKET"
 
-# Indicator windows
-ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "50"))
-BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
-BB_STD_MULT = float(os.getenv("BB_STD_MULT", "2.0"))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+WINDOW_PERIOD = 20
 
-# Volatility filter: ATR proxy / price must be <= this ratio to allow BUY.
-MAX_VOL_THRESHOLD = float(os.getenv("MAX_VOL_THRESHOLD", "0.01"))  # 1.0%
+# Portfolio and sizing rules
+PORTFOLIO_USD = 1_000_000.0
+RISK_PER_TRADE = 0.02
+TARGET_ORDER_USD = PORTFOLIO_USD * RISK_PER_TRADE
 
-# Optional anti-spam safety: minimum seconds between signal publishes.
-SIGNAL_COOLDOWN_SEC = float(os.getenv("SIGNAL_COOLDOWN_SEC", "2.0"))
+POLL_TIMEOUT_SEC = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
+RETRY_DELAY_SEC = int(os.getenv("STRATEGY_RETRY_DELAY_SEC", "5"))
+TRADING_FEE_RATE = float(os.getenv("TRADING_FEE_RATE", "0.001"))
+MIN_SELL_MULTIPLIER = float(os.getenv("MIN_SELL_MULTIPLIER", "1.0025"))
+STOP_LOSS_MULTIPLIER = float(os.getenv("STOP_LOSS_MULTIPLIER", "0.97"))
 
-RETRY_DELAY = 5
-
-
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [Strategy] %(message)s",
@@ -69,12 +60,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── State ──────────────────────────────────────────────────────────────────────
-prices: deque[float] = deque(maxlen=ROLLING_WINDOW)
+SEVERE_FEAR_PROFILE = {"label": "SEVERE_FEAR", "multiplier": 2.95, "reason": "2.95_SD_Panic_Dip"}
+UNEASE_PROFILE = {"label": "UNEASE", "multiplier": 2.45, "reason": "2.45_SD_Unease_Dip"}
+NEUTRAL_PROFILE = {"label": "NEUTRAL", "multiplier": 1.95, "reason": "1.95_SD_Neutral_Dip"}
+HYPE_PROFILE = {"label": "HYPE", "multiplier": 1.45, "reason": "1.45_SD_Hype_Dip"}
 
+
+# Stateful strategy variables
+prices: deque[float] = deque(maxlen=WINDOW_PERIOD)
+latest_sentiment_score = 0.0
 in_position = False
+open_position_quantity = "0.0000"
+pending_action: str | None = None
 entry_price = 0.0
-last_signal_ts = 0.0
+stop_loss_price = 0.0
 
 
 def _handle_shutdown(signum, frame):  # noqa: ANN001
@@ -91,176 +90,307 @@ def _mean(values: list[float]) -> float:
 
 
 def _std(values: list[float], mean_val: float) -> float:
-    # Population std is sufficient for rolling strategy diagnostics.
     variance = sum((v - mean_val) ** 2 for v in values) / len(values)
     return math.sqrt(variance)
 
 
-def _atr_proxy(latest_prices: list[float]) -> float:
-    """
-    ATR proxy from mid-prices only:
-      mean(abs(price_t - price_{t-1})) over ATR_PERIOD deltas.
-    """
-    deltas = [abs(latest_prices[i] - latest_prices[i - 1]) for i in range(1, len(latest_prices))]
-    if not deltas:
-        return 0.0
-    # Use the most recent ATR_PERIOD deltas.
-    tail = deltas[-ATR_PERIOD:]
-    return _mean(tail)
+def resolve_sd_profile(compound_score: float) -> dict[str, float | str]:
+    if compound_score < -0.30:
+        return SEVERE_FEAR_PROFILE
+    if compound_score < -0.05:
+        return UNEASE_PROFILE
+    if compound_score <= 0.25:
+        return NEUTRAL_PROFILE
+    return HYPE_PROFILE
 
 
-def _compute_indicators(latest_prices: list[float]) -> dict[str, float]:
-    bb_slice = latest_prices[-BB_PERIOD:]
-    sma = _mean(bb_slice)
-    std = _std(bb_slice, sma)
-    upper = sma + BB_STD_MULT * std
-    lower = sma - BB_STD_MULT * std
-
-    atr = _atr_proxy(latest_prices)
-    current_price = latest_prices[-1]
-    vol_ratio = (atr / current_price) if current_price > 0 else 0.0
-
-    return {
-        "sma": sma,
-        "upper": upper,
-        "lower": lower,
-        "atr": atr,
-        "vol_ratio": vol_ratio,
-    }
+def compute_bollinger_inputs(latest_prices: list[float]) -> tuple[float, float]:
+    sma = _mean(latest_prices)
+    std = _std(latest_prices, sma)
+    return sma, std
 
 
-def _publish_signal(r: redis.Redis, action: str, symbol: str, reason: str, timestamp: int) -> None:
-    global last_signal_ts
+def target_quantity_from_price(price: float) -> str:
+    if price <= 0:
+        return "0.0000"
+    qty = TARGET_ORDER_USD / price
+    return f"{qty:.4f}"
 
-    now = time.time()
-    if now - last_signal_ts < SIGNAL_COOLDOWN_SEC:
-        log.info(
-            "Signal cooldown active (%.2fs < %.2fs). %s skipped.",
-            now - last_signal_ts,
-            SIGNAL_COOLDOWN_SEC,
-            action,
-        )
-        return
 
-    payload = {
+async def publish_signal(
+    redis_client: aioredis.Redis,
+    *,
+    action: str,
+    symbol: str,
+    quantity: str,
+    reason: str,
+    timestamp: int,
+) -> None:
+    payload: dict[str, Any] = {
         "action": action,
         "symbol": symbol,
-        "type": "MARKET",
+        "type": DEFAULT_ORDER_TYPE,
+        "quantity": quantity,
         "reason": reason,
         "timestamp": timestamp,
     }
-    r.publish(OUT_CHANNEL, json.dumps(payload))
-    last_signal_ts = now
+    await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
     log.info("Signal published → %s", payload)
 
 
-def _evaluate_signal(price: float, symbol: str, timestamp: int, r: redis.Redis) -> None:
-    global in_position, entry_price
-
+async def evaluate_market_tick(price: float, symbol: str, timestamp: int, redis_client: aioredis.Redis) -> None:
+    global pending_action, entry_price, stop_loss_price
     prices.append(price)
-    if len(prices) < BB_PERIOD:
+    if len(prices) < WINDOW_PERIOD:
         log.info(
             "Waiting for window fill: %d/%d prices buffered.",
             len(prices),
-            BB_PERIOD,
+            WINDOW_PERIOD,
         )
         return
 
-    ind = _compute_indicators(list(prices))
-    sma = ind["sma"]
-    lower = ind["lower"]
-    upper = ind["upper"]
-    atr = ind["atr"]
-    vol_ratio = ind["vol_ratio"]
+    sma, std = compute_bollinger_inputs(list(prices))
+    profile = resolve_sd_profile(latest_sentiment_score)
+    dynamic_lower = sma - (float(profile["multiplier"]) * std)
 
+    quantity = target_quantity_from_price(price)
     state = "IN_POSITION" if in_position else "OUT_OF_POSITION"
     log.info(
-        (
-            "px=%.6f | SMA=%.6f | BB[%.6f, %.6f] | ATR~%.6f | vol=%.4f%% "
-            "| state=%s | entry=%.6f"
-        ),
+        "px=%.6f | SMA=%.6f | SD=%.6f | lower=%.6f | sentiment=%.4f (%s %.2fSD) | state=%s",
         price,
         sma,
-        lower,
-        upper,
-        atr,
-        vol_ratio * 100,
+        std,
+        dynamic_lower,
+        latest_sentiment_score,
+        profile["label"],
+        profile["multiplier"],
         state,
-        entry_price,
     )
 
-    # BUY rule (mean reversion + volatility filter)
-    if not in_position:
-        if price < lower and vol_ratio <= MAX_VOL_THRESHOLD:
-            in_position = True
-            entry_price = price
-            _publish_signal(r, "BUY", symbol, "BB_Lower_Cross", timestamp)
+    if pending_action is not None:
+        log.info("Signal suppressed while awaiting %s fill confirmation.", pending_action)
         return
 
-    # SELL rule 1: emergency stop-loss
-    stop_price = entry_price - (1.5 * atr)
-    if price < stop_price:
-        in_position = False
-        _publish_signal(r, "SELL", symbol, "ATR_Stop_Loss", timestamp)
-        entry_price = 0.0
+    if not in_position and price < dynamic_lower:
+        pending_action = "BUY"
+        entry_price = price
+        stop_loss_price = entry_price * STOP_LOSS_MULTIPLIER
+        await publish_signal(
+            redis_client,
+            action="BUY",
+            symbol=symbol,
+            quantity=quantity,
+            reason=str(profile["reason"]),
+            timestamp=timestamp,
+        )
         return
 
-    # SELL rule 2: take-profit at mean reversion back to middle band.
-    if price >= sma:
-        in_position = False
-        _publish_signal(r, "SELL", symbol, "Mean_Reversion_TP", timestamp)
-        entry_price = 0.0
+    if in_position and price <= stop_loss_price:
+        pending_action = "SELL"
+        await publish_signal(
+            redis_client,
+            action="SELL",
+            symbol=symbol,
+            quantity=open_position_quantity,
+            reason="Stop_Loss_3pct",
+            timestamp=timestamp,
+        )
+        log.warning("Stop-Loss triggered at -3%%.")
+        return
+
+    if in_position and price >= sma:
+        minimum_sell_price = entry_price * MIN_SELL_MULTIPLIER
+        if price >= minimum_sell_price:
+            pending_action = "SELL"
+            await publish_signal(
+                redis_client,
+                action="SELL",
+                symbol=symbol,
+                quantity=open_position_quantity,
+                reason="Mean_Reversion_TP",
+                timestamp=timestamp,
+            )
+            return
+
+        log.info("Holding position: SMA reached but 0.25%% fee spread not met")
 
 
-def run() -> None:
+def _extract_executed_quantity(order_result: dict[str, Any]) -> float:
+    order_details = order_result.get("order_details")
+    if isinstance(order_details, dict):
+        for key in ("FilledQuantity", "Quantity"):
+            value = order_details.get(key)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+
+    for key in ("effective_qty", "qty"):
+        value = order_result.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+
+    return 0.0
+
+
+def handle_order_result_update(raw_payload: str) -> None:
+    global in_position, open_position_quantity, pending_action, entry_price, stop_loss_price
+    try:
+        data = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        log.warning("Malformed order_results payload skipped: %r | error: %s", raw_payload, exc)
+        return
+
+    side = str(data.get("side", "")).upper()
+    result = str(data.get("result", "")).upper()
+
+    if side not in {"BUY", "SELL"}:
+        return
+
+    if result != "SUCCESS":
+        if pending_action == side:
+            log.info("%s failed, clearing pending action.", side)
+            if side == "BUY":
+                entry_price = 0.0
+                stop_loss_price = 0.0
+            pending_action = None
+        return
+
+    executed_qty = _extract_executed_quantity(data)
+
+    if side == "BUY":
+        net_qty = max(executed_qty * (1.0 - TRADING_FEE_RATE), 0.0)
+        in_position = net_qty > 0
+        open_position_quantity = f"{net_qty:.4f}"
+        pending_action = None
+        log.info(
+            "BUY fill confirmed: executed=%.8f, fee_rate=%.4f, net_position=%s",
+            executed_qty,
+            TRADING_FEE_RATE,
+            open_position_quantity,
+        )
+        return
+
+    if side == "SELL":
+        try:
+            current_qty = float(open_position_quantity)
+        except ValueError:
+            current_qty = 0.0
+
+        remaining = max(current_qty - executed_qty, 0.0)
+        in_position = remaining > 0
+        open_position_quantity = f"{remaining:.4f}"
+        if remaining <= 0.0:
+            entry_price = 0.0
+            stop_loss_price = 0.0
+        pending_action = None
+        log.info(
+            "SELL fill confirmed: executed=%.8f, remaining_position=%s",
+            executed_qty,
+            open_position_quantity,
+        )
+
+
+def handle_sentiment_update(raw_payload: str) -> None:
+    global latest_sentiment_score
+    try:
+        data = json.loads(raw_payload)
+        score = float(data.get("compound_score", 0.0))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("Malformed sentiment payload skipped: %r | error: %s", raw_payload, exc)
+        return
+
+    latest_sentiment_score = score
+    profile = resolve_sd_profile(latest_sentiment_score)
     log.info(
-        (
-            "Strategy engine starting | BB_PERIOD=%d STD=%.2f ATR_PERIOD=%d "
-            "MAX_VOL_THRESHOLD=%.4f"
-        ),
-        BB_PERIOD,
-        BB_STD_MULT,
-        ATR_PERIOD,
-        MAX_VOL_THRESHOLD,
+        "Sentiment updated: score=%.4f -> profile=%s (%.2f SD)",
+        latest_sentiment_score,
+        profile["label"],
+        float(profile["multiplier"]),
+    )
+
+
+async def consume_stream(redis_client: aioredis.Redis) -> None:
+    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+    await pubsub.subscribe(MARKET_DATA_CHANNEL, SENTIMENT_CHANNEL, ORDER_RESULTS_CHANNEL)
+
+    log.info(
+        "Strategy engine listening on channels: %s, %s, %s",
+        MARKET_DATA_CHANNEL,
+        SENTIMENT_CHANNEL,
+        ORDER_RESULTS_CHANNEL,
+    )
+
+    try:
+        while True:
+            message = await pubsub.get_message(timeout=POLL_TIMEOUT_SEC)
+            if message is None:
+                continue
+
+            if message.get("type") != "message":
+                continue
+
+            channel = str(message.get("channel", ""))
+            raw_data = message.get("data", "")
+            payload = raw_data.decode("utf-8", errors="replace") if isinstance(raw_data, bytes) else str(raw_data)
+
+            if channel == SENTIMENT_CHANNEL:
+                handle_sentiment_update(payload)
+                continue
+
+            if channel == ORDER_RESULTS_CHANNEL:
+                handle_order_result_update(payload)
+                continue
+
+            if channel != MARKET_DATA_CHANNEL:
+                continue
+
+            try:
+                tick = json.loads(payload)
+                price = float(tick["mid_price"])
+                timestamp = int(tick.get("timestamp", time.time()))
+                symbol = str(tick.get("symbol", DEFAULT_SYMBOL))
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                log.warning("Malformed market_data payload skipped: %r | error: %s", payload, exc)
+                continue
+
+            await evaluate_market_tick(price, symbol, timestamp, redis_client)
+    finally:
+        await pubsub.unsubscribe(MARKET_DATA_CHANNEL, SENTIMENT_CHANNEL, ORDER_RESULTS_CHANNEL)
+        await pubsub.aclose()
+
+
+async def run() -> None:
+    log.info(
+        "Strategy engine starting | window=%d | target_notional=$%.2f | default_sentiment=%.2f",
+        WINDOW_PERIOD,
+        TARGET_ORDER_USD,
+        latest_sentiment_score,
     )
 
     while True:
+        redis_client: aioredis.Redis | None = None
         try:
-            r = redis.Redis(
+            redis_client = aioredis.Redis(
                 host=REDIS_HOST,
                 port=REDIS_PORT,
                 decode_responses=True,
                 socket_connect_timeout=5,
             )
-            r.ping()
-            log.info("Connected to Redis at %s:%s.", REDIS_HOST, REDIS_PORT)
-
-            pubsub = r.pubsub(ignore_subscribe_messages=True)
-            pubsub.subscribe(IN_CHANNEL)
-            log.info("Listening on '%s' …", IN_CHANNEL)
-
-            for message in pubsub.listen():
-                if message["type"] != "message":
-                    continue
-
-                try:
-                    data = json.loads(message["data"])
-                    price = float(data["mid_price"])
-                    timestamp = int(data["timestamp"])
-                    symbol = str(data.get("symbol", DEFAULT_SYMBOL))
-                except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    log.warning("Malformed market_data message skipped: %s | error: %s", message["data"], exc)
-                    continue
-
-                _evaluate_signal(price, symbol, timestamp, r)
-
-        except redis.exceptions.ConnectionError as exc:
-            log.error("Redis connection lost: %s. Retrying in %ds …", exc, RETRY_DELAY)
-            time.sleep(RETRY_DELAY)
-        except redis.exceptions.RedisError as exc:
-            log.error("Redis error: %s. Retrying in %ds …", exc, RETRY_DELAY)
-            time.sleep(RETRY_DELAY)
+            await redis_client.ping()
+            log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
+            await consume_stream(redis_client)
+        except aioredis.RedisError as exc:
+            log.error("Redis error: %s. Retrying in %ds", exc, RETRY_DELAY_SEC)
+            await asyncio.sleep(RETRY_DELAY_SEC)
+        finally:
+            if redis_client is not None:
+                await redis_client.aclose()
 
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(run())

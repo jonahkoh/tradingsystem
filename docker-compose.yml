@@ -110,6 +110,69 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Process A2 — Feed Handler (SOL) ──────────────────────────────────────────
+  # Reuses the same market_data.py image; TRADE_SYMBOL override switches the pair.
+  feed-handler-sol:
+    build:
+      context: .
+      dockerfile: services/feed-handler/Dockerfile
+    container_name: tradingsystem_feed_handler_sol
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: SOL/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process H — SOL EMA Momentum Strategy ─────────────────────────────────────
+  sol-strategy-engine:
+    build:
+      context: .
+      dockerfile: services/sol-strategy/Dockerfile
+    container_name: tradingsystem_sol_strategy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: SOL/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process A3 — Feed Handler (XRP) ──────────────────────────────────────────
+  # Reuses the same market_data.py image; TRADE_SYMBOL override switches the pair.
+  # Publishes {"symbol": "XRP/USD", ...} to the shared market_data channel.
+  feed-handler-xrp:
+    build:
+      context: .
+      dockerfile: services/feed-handler/Dockerfile
+    container_name: tradingsystem_feed_handler_xrp
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: XRP/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process G — XRP ATR Breakout Strategy ─────────────────────────────────────
+  xrp-strategy-engine:
+    build:
+      context: .
+      dockerfile: services/xrp-strategy/Dockerfile
+    container_name: tradingsystem_xrp_strategy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: XRP/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:
 

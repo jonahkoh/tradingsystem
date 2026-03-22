@@ -27,6 +27,7 @@ import os
 import signal
 import threading
 import time
+import csv
 from typing import Any
 
 import httpx
@@ -54,6 +55,31 @@ RETRY_DELAY_SEC = 5
 AUTH_DEBUG = os.getenv("AUTH_DEBUG", "false").lower() == "true"
 SELL_QTY_EPSILON = float(os.getenv("SELL_QTY_EPSILON", "0.00000001"))
 MIN_TRADABLE_QTY = float(os.getenv("MIN_TRADABLE_QTY", "0.000001"))
+QUERY_ORDER_LIMIT = int(os.getenv("QUERY_ORDER_LIMIT", "100"))
+STARTUP_SYNC_DELAY_SEC = float(os.getenv("STARTUP_SYNC_DELAY_SEC", "3.0"))
+SYNC_STATE_ON_STARTUP = os.getenv("SYNC_STATE_ON_STARTUP", "true").lower() == "true"
+SYNC_HISTORY_TO_LEDGER = os.getenv("SYNC_HISTORY_TO_LEDGER", "true").lower() == "true"
+CLEAR_LEDGER_CSV_ON_STARTUP = os.getenv("CLEAR_LEDGER_CSV_ON_STARTUP", "true").lower() == "true"
+MIN_HOLD_NOTIONAL_USD = float(os.getenv("MIN_HOLD_NOTIONAL_USD", "15.0"))
+INVENTORY_SYNC_PAIRS = [
+    p.strip().upper()
+    for p in os.getenv("INVENTORY_SYNC_PAIRS", "BTC/USD,ETH/USD,SOL/USD,XRP/USD,FET/USD").split(",")
+    if p.strip()
+]
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+LOG_FILE = os.getenv("LOG_FILE", os.path.join(LOG_DIR, "execution_log.csv"))
+
+CSV_HEADERS = [
+    "Timestamp",
+    "Action",
+    "Pair",
+    "Price",
+    "Quantity",
+    "Requested_Qty",
+    "Effective_Qty",
+    "Strategy_Signal",
+    "API_Status",
+]
 
 SIGNALS_CHANNEL = "trade_signals"
 CONTROL_CHANNEL = "control"
@@ -61,6 +87,9 @@ RESULTS_CHANNEL = "order_results"
 EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 BALANCE_URL_PATH = "/v3/balance"
 CANCEL_ALL_ORDERS_PATH = "/v3/cancel_all_open_orders"
+QUERY_ORDER_PATH = "/v3/query_order"
+TICKER_URL_PATH = "/v3/ticker"
+HISTORY_LAST_SYNC_ORDER_ID_KEY = "execution:history_last_sync_order_id"
 
 
 logging.basicConfig(
@@ -395,6 +424,309 @@ def _extract_actual_fill_price(response_json: Any) -> float:
     return 0.0
 
 
+def _query_orders(
+    http_client: httpx.Client,
+    *,
+    pair: str | None = None,
+    offset: int | None = None,
+    limit: int = QUERY_ORDER_LIMIT,
+    pending_only: bool | None = None,
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "timestamp": _current_ms(),
+        "limit": str(max(limit, 1)),
+    }
+    # Roostoo query_order rejects offset=0. Omit offset unless caller provides >= 1.
+    if offset is not None:
+        params["offset"] = str(max(offset, 1))
+    if pair:
+        params["pair"] = pair.strip().upper()
+    if pending_only is not None:
+        params["pending_only"] = "TRUE" if pending_only else "FALSE"
+
+    payload = _sorted_params_string(params)
+    signature = _sign_message(SECRET_KEY, payload)
+    headers = {
+        "RST-API-KEY": API_KEY,
+        "MSG-SIGNATURE": signature,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    url = f"{ROOSTOO_BASE_URL}{QUERY_ORDER_PATH}"
+    response = http_client.post(url, content=payload, headers=headers)
+
+    try:
+        response_json = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"query_order returned non-JSON: {response.text}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"query_order failed: {response.status_code} {response.text}")
+
+    if not isinstance(response_json, dict):
+        raise RuntimeError(f"query_order unsuccessful: {response_json}")
+
+    if not bool(response_json.get("Success", False)):
+        err = str(response_json.get("ErrMsg", ""))
+        if "no order matched" in err.lower():
+            return []
+        raise RuntimeError(f"query_order unsuccessful: {err or response_json}")
+
+    orders = response_json.get("OrderMatched", [])
+    if not isinstance(orders, list):
+        return []
+    return [o for o in orders if isinstance(o, dict)]
+
+
+def _query_all_orders(http_client: httpx.Client, *, pair: str | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    offset: int | None = None
+    page_size = max(QUERY_ORDER_LIMIT, 1)
+
+    while True:
+        page = _query_orders(http_client, pair=pair, offset=offset, limit=page_size)
+        if not page:
+            break
+
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset = len(out)
+
+    return out
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_mid_price(http_client: httpx.Client, pair: str) -> float:
+    params = {
+        "pair": pair.strip().upper(),
+        "timestamp": str(_current_ms()),
+    }
+    response = http_client.get(f"{ROOSTOO_BASE_URL}{TICKER_URL_PATH}", params=params)
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return 0.0
+
+    if response.status_code >= 400 or not isinstance(payload, dict) or not bool(payload.get("Success", False)):
+        return 0.0
+
+    data = payload.get("Data")
+    if not isinstance(data, dict):
+        return 0.0
+
+    pair_block = data.get(pair.upper())
+    if not isinstance(pair_block, dict):
+        return 0.0
+
+    max_bid = _safe_float(pair_block.get("MaxBid"))
+    min_ask = _safe_float(pair_block.get("MinAsk"))
+    if max_bid <= 0.0 or min_ask <= 0.0:
+        return 0.0
+
+    return (max_bid + min_ask) / 2.0
+
+
+def _pair_step_decimals(pair: str) -> int:
+    pair_upper = pair.upper()
+    if pair_upper in {"SOL/USD", "XRP/USD"}:
+        return 0
+    if pair_upper == "FET/USD":
+        return 1
+    return 4
+
+
+def _format_qty_for_pair(pair: str, qty: float) -> str:
+    decimals = _pair_step_decimals(pair)
+    q = _floor_to_decimals(max(qty, 0.0), decimals)
+    if decimals == 0:
+        return str(int(q))
+    return f"{q:.{decimals}f}"
+
+
+def _strategy_state_from_inventory(
+    pair: str,
+    held_qty: float,
+    entry_price: float,
+    reference_price: float,
+) -> dict[str, str]:
+    qty_text = _format_qty_for_pair(pair, held_qty)
+    rounded_qty = _safe_float(qty_text)
+    notional_usd = max(rounded_qty, 0.0) * max(reference_price, 0.0)
+    in_position = (
+        rounded_qty >= MIN_TRADABLE_QTY
+        and (
+            reference_price <= 0.0
+            or notional_usd >= MIN_HOLD_NOTIONAL_USD
+        )
+    )
+    pair_upper = pair.upper()
+
+    if pair_upper in {"SOL/USD", "XRP/USD", "FET/USD"}:
+        return {
+            "in_position": str(in_position),
+            "open_position_quantity": qty_text,
+            "entry_price": str(max(entry_price, 0.0)),
+            "atr_at_entry": "0.0",
+            "cooldown_until": "0.0",
+        }
+
+    return {
+        "in_position": str(in_position),
+        "open_position_quantity": qty_text,
+        "entry_price": str(max(entry_price, 0.0)),
+        "stop_loss_price": "0.0",
+        "half_position_sold": "False",
+        "cooldown_until": "0.0",
+    }
+
+
+def _estimate_entry_price_from_orders(orders: list[dict[str, Any]]) -> float:
+    avg_cost = 0.0
+    qty = 0.0
+
+    sortable = sorted(
+        orders,
+        key=lambda o: (_safe_int(o.get("CreateTimestamp")), _safe_int(o.get("OrderID"))),
+    )
+    for order in sortable:
+        status = str(order.get("Status", "")).upper()
+        if status != "FILLED":
+            continue
+
+        side = str(order.get("Side", "")).upper()
+        filled_qty = _safe_float(order.get("FilledQuantity") or order.get("Quantity"))
+        if filled_qty <= 0:
+            continue
+
+        fill_price = _safe_float(order.get("FilledAverPrice") or order.get("Price"))
+        if fill_price <= 0:
+            continue
+
+        if side == "BUY":
+            total_cost = avg_cost * qty + fill_price * filled_qty
+            qty += filled_qty
+            avg_cost = total_cost / qty if qty > 0 else 0.0
+        elif side == "SELL":
+            qty = max(qty - filled_qty, 0.0)
+            if qty <= 0.0:
+                avg_cost = 0.0
+
+    return avg_cost
+
+
+def _build_history_result_payload(order: dict[str, Any]) -> dict[str, Any]:
+    status = str(order.get("Status", "")).upper()
+    result = "SUCCESS" if status == "FILLED" else "FAILED"
+    ts = _safe_int(order.get("FinishTimestamp")) or _safe_int(order.get("CreateTimestamp"))
+    return {
+        "timestamp": ts or int(time.time()),
+        "result": result,
+        "status_code": 200,
+        "latency_ms": 0,
+        "order_id": order.get("OrderID"),
+        "side": str(order.get("Side", "")).upper(),
+        "symbol": str(order.get("Pair", "")).upper(),
+        "qty": _safe_float(order.get("FilledQuantity") or order.get("Quantity")),
+        "requested_qty": _safe_float(order.get("Quantity")),
+        "effective_qty": _safe_float(order.get("FilledQuantity") or order.get("Quantity")),
+        "price": _safe_float(order.get("FilledAverPrice") or order.get("Price")),
+        "order_details": order,
+        "strategy_signal": "ROOSTOO_HISTORY_SYNC",
+        "raw_error": "" if result == "SUCCESS" else f"historical_status={status or 'UNKNOWN'}",
+    }
+
+
+def _sync_strategy_state_from_roostoo(http_client: httpx.Client, redis_client: redis.Redis) -> None:
+    synced = 0
+    for pair in INVENTORY_SYNC_PAIRS:
+        free_qty, locked_qty = _get_balance_snapshot(http_client, pair)
+        held_qty = max(free_qty + locked_qty, 0.0)
+        pair_orders = _query_all_orders(http_client, pair=pair)
+        entry_price = _estimate_entry_price_from_orders(pair_orders)
+        market_price = _get_mid_price(http_client, pair)
+        ref_price = market_price if market_price > 0.0 else entry_price
+
+        state_key = f"strategy_state:{pair}"
+        mapping = _strategy_state_from_inventory(pair, held_qty, entry_price, ref_price)
+        redis_client.hset(state_key, mapping=mapping)
+        synced += 1
+        log.info(
+            "Startup state sync | pair=%s held=%.8f entry=%.8f ref=%.8f in_position=%s key=%s",
+            pair,
+            held_qty,
+            entry_price,
+            ref_price,
+            mapping.get("in_position"),
+            state_key,
+        )
+
+    log.info("Startup strategy state sync completed for %d pairs.", synced)
+
+
+def _sync_order_history_to_ledger(http_client: httpx.Client, redis_client: redis.Redis) -> None:
+    all_orders = _query_all_orders(http_client, pair=None)
+    if not all_orders:
+        log.info("History sync: no orders returned from query_order.")
+        return
+
+    all_orders.sort(key=lambda o: _safe_int(o.get("OrderID")))
+
+    last_synced = _safe_int(redis_client.get(HISTORY_LAST_SYNC_ORDER_ID_KEY))
+    published = 0
+    max_order_id = last_synced
+
+    for order in all_orders:
+        order_id = _safe_int(order.get("OrderID"))
+        if order_id <= last_synced:
+            continue
+
+        result_payload = _build_history_result_payload(order)
+        redis_client.publish(RESULTS_CHANNEL, json.dumps(result_payload))
+        published += 1
+        if order_id > max_order_id:
+            max_order_id = order_id
+
+    if max_order_id > last_synced:
+        redis_client.set(HISTORY_LAST_SYNC_ORDER_ID_KEY, str(max_order_id))
+
+    log.info(
+        "History sync complete | published=%d last_order_id=%d",
+        published,
+        max_order_id,
+    )
+
+
+def _clear_ledger_csv_file(redis_client: redis.Redis) -> None:
+    if not CLEAR_LEDGER_CSV_ON_STARTUP:
+        return
+
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+        with open(LOG_FILE, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=CSV_HEADERS)
+            writer.writeheader()
+        # Force a full history replay after CSV reset.
+        redis_client.set(HISTORY_LAST_SYNC_ORDER_ID_KEY, "0")
+        log.info("Startup CSV reset complete | file=%s", LOG_FILE)
+    except OSError as exc:
+        log.warning("Startup CSV reset skipped (unable to write %s): %s", LOG_FILE, exc)
+
+
 def _publish_execution_confirmation(
     redis_client: redis.Redis,
     *,
@@ -464,15 +796,29 @@ def execute_trade_signal(
                 ),
             )
             redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
-            # Always publish a confirmation so strategy engines can clear pending_action.
-            _publish_execution_confirmation(
-                redis_client,
-                signal_payload=signal_payload,
-                result_payload=result,
-            )
             return result
 
     effective_qty = _floor_to_decimals(effective_qty, 8)
+
+    if effective_qty < MIN_TRADABLE_QTY:
+        result = _build_order_result(
+            success=False,
+            status_code=400,
+            latency_ms=0,
+            side=side,
+            pair=pair,
+            quantity=f"{effective_qty:.8f}",
+            requested_qty=requested_qty,
+            effective_qty=effective_qty,
+            response_json=None,
+            raw_error=(
+                "order skipped: effective quantity below minimum tradable "
+                f"(effective={effective_qty:.8f}, min={MIN_TRADABLE_QTY:.8f})"
+            ),
+        )
+        redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
+        return result
+
     quantity = f"{effective_qty:.8f}"
 
     params = {
@@ -672,62 +1018,15 @@ def run() -> None:
                 r.ping()
                 log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
-                # DISABLED: startup sell-all liquidation — commented out for dashboard testing
-                # base_free, base_locked = _get_balance_snapshot(http_client, DEFAULT_PAIR)
-                # base_total = base_free + base_locked
-                #
-                # if base_total > MIN_TRADABLE_QTY:
-                #     if base_locked > MIN_TRADABLE_QTY:
-                #         log.warning(
-                #             "Startup sync found locked balance %.8f. Cancelling open orders first.",
-                #             base_locked,
-                #         )
-                #         _cancel_all_open_orders(http_client, DEFAULT_PAIR)
-                #         time.sleep(0.2)
-                #         base_free = _get_available_base_balance(http_client, DEFAULT_PAIR)
-                #
-                #     log.warning(
-                #         "Startup balance sync found free %.8f (total %.8f). Triggering emergency SELL ALL.",
-                #         base_free,
-                #         base_total,
-                #     )
-                #     if base_free > MIN_TRADABLE_QTY:
-                #         startup_signal = {
-                #             "action": "SELL",
-                #             "symbol": DEFAULT_PAIR,
-                #             "type": "MARKET",
-                #             "quantity": "ALL",
-                #             "reason": "STARTUP_BALANCE_SYNC",
-                #         }
-                #         startup_result = execute_trade_signal(startup_signal, http_client, r, throttle)
-                #         _publish_execution_confirmation(
-                #             r,
-                #             signal_payload=startup_signal,
-                #             result_payload=startup_result,
-                #         )
-                #     else:
-                #         log.warning("Startup sync could not free locked balance yet; SELL ALL skipped this cycle.")
-                # else:
-                #     startup_clear_signal = {
-                #         "action": "SELL",
-                #         "symbol": DEFAULT_PAIR,
-                #         "type": "MARKET",
-                #         "quantity": "0",
-                #         "reason": "STARTUP_BALANCE_SYNC_CLEAR",
-                #     }
-                #     startup_clear_result = {
-                #         "result": "SUCCESS",
-                #         "status_code": 200,
-                #         "requested_qty": 0.0,
-                #         "effective_qty": 0.0,
-                #     }
-                #     _publish_execution_confirmation(
-                #         r,
-                #         signal_payload=startup_clear_signal,
-                #         result_payload=startup_clear_result,
-                #     )
-                #     log.info("Startup balance sync clear: no leftover base asset.")
-                log.info("Startup liquidation DISABLED for dashboard testing.")
+                if SYNC_STATE_ON_STARTUP or SYNC_HISTORY_TO_LEDGER:
+                    time.sleep(max(STARTUP_SYNC_DELAY_SEC, 0.0))
+
+                if SYNC_HISTORY_TO_LEDGER:
+                    _clear_ledger_csv_file(r)
+                    _sync_order_history_to_ledger(http_client, r)
+
+                if SYNC_STATE_ON_STARTUP:
+                    _sync_strategy_state_from_roostoo(http_client, r)
 
                 pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(SIGNALS_CHANNEL, CONTROL_CHANNEL)

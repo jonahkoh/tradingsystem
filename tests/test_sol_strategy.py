@@ -7,15 +7,20 @@ import unittest
 from tests.test_loader import load_module
 
 
-sol = load_module("sol_strategy_mod", "services/sol-strategy/sol_strategy_engine.py")
+sol = load_module("sol_strategy_mod", "services/strategy-engine/sol_strategy_engine.py")
 
 
 class _RedisStub:
     def __init__(self):
         self.messages = []
+        self.hashes = {}
 
     async def publish(self, channel, payload):
         self.messages.append((channel, payload))
+        return 1
+
+    async def hset(self, key, mapping):
+        self.hashes[key] = dict(mapping)
         return 1
 
 
@@ -126,15 +131,16 @@ class SolStrategyTests(unittest.TestCase):
         sol.entry_price    = 150.0
 
         executed_qty = 10.0
-        sol.handle_execution_confirmation(json.dumps({
+        asyncio.run(sol.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "BUY",
+            "symbol":       "SOL/USD",
             "effective_qty": executed_qty,
-        }))
+        }), _RedisStub()))
 
-        expected_net = executed_qty * (1.0 - sol.TRADING_FEE_RATE)
+        expected_net = int((executed_qty * (1.0 - sol.TRADING_FEE_RATE)) // 1)
         self.assertTrue(sol.in_position)
-        self.assertAlmostEqual(float(sol.open_position_quantity), expected_net, places=3)
+        self.assertEqual(float(sol.open_position_quantity), float(expected_net))
         self.assertIsNone(sol.pending_action)
 
     # ── ATR stop-loss ─────────────────────────────────────────────────────────
@@ -146,13 +152,14 @@ class SolStrategyTests(unittest.TestCase):
         sol.in_position            = True
         sol.open_position_quantity = "500.0000"
         sol.entry_price            = 100.0
-        sol.atr_at_entry           = 5.0   # stop = 100 - 2×5 = 90
+        sol.atr_at_entry           = 5.0
         # EMAs positioned so there is no death cross at the test price.
         sol.fast_ema = 90.0
         sol.slow_ema = 95.0   # fast < slow — death cross guard (no flip)
 
-        # Price drops to 89 (< stop 90).
-        asyncio.run(sol.evaluate_market_tick(89.0, "SOL/USD", 3, redis_stub))
+        stop_price = sol.entry_price - (sol.ATR_STOPLOSS_K * sol.atr_at_entry)
+        # Use a price strictly below the computed stop so env overrides remain valid.
+        asyncio.run(sol.evaluate_market_tick(stop_price - 1.0, "SOL/USD", 3, redis_stub))
 
         self.assertEqual(len(redis_stub.messages), 1)
         _, raw = redis_stub.messages[0]
@@ -168,9 +175,9 @@ class SolStrategyTests(unittest.TestCase):
         sol.tick_count             = sol.EMA_SLOW_PERIOD + 1
         sol.in_position            = True
         sol.open_position_quantity = "500.0000"
-        sol.entry_price            = 100.0
+        sol.entry_price            = 95.0
         # Make ATR stop unreachably low so only the death cross can exit.
-        sol.atr_at_entry           = 1000.0   # stop = 100 - 2000 = -1900
+        sol.atr_at_entry           = 1000.0
 
         # Place EMAs just barely crossing: fast 100.01 > slow 100.00.
         # Price = 99.0 tips them: new_fast < new_slow → death cross.
@@ -213,11 +220,12 @@ class SolStrategyTests(unittest.TestCase):
         sol.atr_at_entry           = 5.0
         sol.pending_action         = "SELL"
 
-        sol.handle_execution_confirmation(json.dumps({
+        asyncio.run(sol.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "SELL",
+            "symbol":       "SOL/USD",
             "effective_qty": 10.0,
-        }))
+        }), _RedisStub()))
 
         self.assertFalse(sol.in_position)
         self.assertEqual(sol.open_position_quantity, "0.0000")

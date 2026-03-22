@@ -8,15 +8,20 @@ from collections import deque
 from tests.test_loader import load_module
 
 
-xrp = load_module("xrp_strategy_mod", "services/xrp-strategy/xrp_strategy_engine.py")
+xrp = load_module("xrp_strategy_mod", "services/strategy-engine/xrp_strategy_engine.py")
 
 
 class _RedisStub:
     def __init__(self):
         self.messages = []
+        self.hashes = {}
 
     async def publish(self, channel, payload):
         self.messages.append((channel, payload))
+        return 1
+
+    async def hset(self, key, mapping):
+        self.hashes[key] = dict(mapping)
         return 1
 
 
@@ -73,11 +78,11 @@ class XrpStrategyTests(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=8)
 
     def test_target_quantity(self):
-        """_target_quantity floors to 4dp: TARGET_ORDER_USD / price."""
+        """_target_quantity floors to whole units for XRP."""
         import math
         price    = 0.50
-        expected = math.floor((xrp.TARGET_ORDER_USD / price) * 10_000) / 10_000
-        self.assertEqual(xrp._target_quantity(price), f"{expected:.4f}")
+        expected = int(math.floor(xrp.TARGET_ORDER_USD / price))
+        self.assertEqual(xrp._target_quantity(price), str(expected))
 
     # ── ATR warm-up ────────────────────────────────────────────────────────────
     def test_first_tick_sets_last_price_only(self):
@@ -161,11 +166,12 @@ class XrpStrategyTests(unittest.TestCase):
         xrp.atr_at_entry   = 0.05
 
         executed_qty = 1000.0
-        xrp.handle_execution_confirmation(json.dumps({
+        asyncio.run(xrp.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "BUY",
+            "symbol":       "XRP/USD",
             "effective_qty": executed_qty,
-        }))
+        }), _RedisStub()))
 
         expected_net = executed_qty * (1.0 - xrp.TRADING_FEE_RATE)
         self.assertTrue(xrp.in_position)
@@ -231,10 +237,14 @@ class XrpStrategyTests(unittest.TestCase):
         xrp.atr_value              = 0.01
         xrp.atr_initialized        = True
         xrp.last_price             = 1.03
-        # Score below exit gate (-0.15) while price is above entry → exit.
+        # Score below exit gate while price is above entry.
         xrp.xrp_sentiment_score    = -0.20
 
-        asyncio.run(xrp.evaluate_market_tick(1.04, "XRP/USD", 6, redis_stub))
+        take_profit_price = xrp.entry_price * xrp.TAKE_PROFIT_MULT
+        test_price = (xrp.entry_price + take_profit_price) / 2.0
+        xrp.last_price = max(xrp.entry_price + 0.001, test_price - 0.001)
+
+        asyncio.run(xrp.evaluate_market_tick(test_price, "XRP/USD", 6, redis_stub))
 
         self.assertEqual(len(redis_stub.messages), 1)
         _, raw = redis_stub.messages[0]
@@ -269,11 +279,12 @@ class XrpStrategyTests(unittest.TestCase):
         xrp.atr_at_entry           = 0.05
         xrp.pending_action         = "SELL"
 
-        xrp.handle_execution_confirmation(json.dumps({
+        asyncio.run(xrp.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "SELL",
+            "symbol":       "XRP/USD",
             "effective_qty": 1500.0,
-        }))
+        }), _RedisStub()))
 
         self.assertFalse(xrp.in_position)
         self.assertEqual(xrp.open_position_quantity, "0.0000")
@@ -328,12 +339,12 @@ class XrpStrategyTests(unittest.TestCase):
         xrp.pending_action = "BUY"
         xrp.entry_price    = 1.20
 
-        xrp.handle_execution_confirmation(json.dumps({
+        asyncio.run(xrp.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "BUY",
             "symbol":       "SOL/USD",   # wrong symbol
             "effective_qty": 1000.0,
-        }))
+        }), _RedisStub()))
 
         # State must be unchanged.
         self.assertEqual(xrp.pending_action, "BUY")

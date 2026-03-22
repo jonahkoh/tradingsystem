@@ -7,15 +7,20 @@ import unittest
 from tests.test_loader import load_module
 
 
-strategy = load_module("strategy_mod", "services/strategy-engine/strategy_engine.py")
+strategy = load_module("strategy_mod", "services/strategy-engine/btc_eth_strategy_engine.py")
 
 
 class _RedisStub:
     def __init__(self):
         self.messages = []
+        self.hashes = {}
 
     async def publish(self, channel, payload):
         self.messages.append((channel, payload))
+        return 1
+
+    async def hset(self, key, mapping):
+        self.hashes[key] = dict(mapping)
         return 1
 
 
@@ -122,11 +127,12 @@ class StrategyEngineTests(unittest.TestCase):
 
         # Confirm BUY fill — uses any sensible executed qty.
         executed_qty = 94.0
-        strategy.handle_execution_confirmation(json.dumps({
+        asyncio.run(strategy.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "BUY",
+            "symbol":       "BTC/USD",
             "effective_qty": executed_qty,
-        }))
+        }), redis_stub))
 
         expected_net = executed_qty * (1.0 - strategy.TRADING_FEE_RATE)
         self.assertTrue(strategy.in_position)
@@ -181,11 +187,12 @@ class StrategyEngineTests(unittest.TestCase):
         self.assertEqual(payload["quantity"], "0.1250")   # half of 0.25
 
         # Confirm partial fill.
-        strategy.handle_execution_confirmation(json.dumps({
+        asyncio.run(strategy.handle_execution_confirmation(json.dumps({
             "result":       "SUCCESS",
             "action":       "SELL",
+            "symbol":       "BTC/USD",
             "effective_qty": 0.125,
-        }))
+        }), redis_stub))
         self.assertTrue(strategy.in_position)       # still holding second half
         self.assertEqual(strategy.open_position_quantity, "0.1250")
         self.assertTrue(strategy.half_position_sold)
@@ -280,6 +287,21 @@ class StrategyEngineTests(unittest.TestCase):
 
         self.assertEqual(len(redis_stub.messages), 0)
         self.assertIsNone(strategy.pending_action)
+
+    def test_confirmation_for_other_symbol_is_ignored(self):
+        redis_stub = _RedisStub()
+        strategy.pending_action = "BUY"
+        strategy.entry_price = 100.0
+
+        asyncio.run(strategy.handle_execution_confirmation(json.dumps({
+            "result": "SUCCESS",
+            "action": "BUY",
+            "symbol": "ETH/USD",
+            "effective_qty": 1.0,
+        }), redis_stub))
+
+        self.assertEqual(strategy.pending_action, "BUY")
+        self.assertFalse(strategy.in_position)
 
 
 if __name__ == "__main__":

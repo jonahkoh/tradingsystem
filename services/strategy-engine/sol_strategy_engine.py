@@ -1,32 +1,45 @@
-"""Process H — SOL DCA (Dollar Cost Averaging) Strategy Engine.
+"""Process H — SOL Adaptive Multi-Regime Strategy Engine.
 
-SOL is a high-beta, retail-driven asset that trends hard in both directions.
-In bearish/choppy markets, EMA crossover whipsaws repeatedly. DCA adapts by
-buying in tranches as price falls, lowering the average cost basis so that a
-partial recovery is enough to take profit.
+SOL is a high-beta, retail-driven asset that transitions between distinct market
+regimes. A single fixed strategy underperforms across all conditions:
+  • DCA alone sits idle in flat markets and whipsaws in strong trends.
+  • Breakout alone generates false entries in ranges.
+  • Mean-reversion alone loses badly in strong trends.
 
-Strategy: DCA Tranche Buying with Sentiment-Scaled Sizing
-──────────────────────────────────────────────────────────
-  ENTRY 1 — First tranche: price dips INITIAL_DIP_PCT% below SMA(20)
-             AND sentiment > SENTIMENT_GATE
-  ENTRY N — Each subsequent tranche: price dips TRANCHE_DIP_PCT% below
-             the previous buy price, up to MAX_TRANCHES total
+This engine detects the current market regime from three independent indicators
+and applies the optimal strategy for each:
 
-  EXIT 1  — Take-profit: price >= average_cost × (1 + PROFIT_MARGIN)
-             Sells ALL tranches in one signal
-  EXIT 2  — ATR stop-loss: price drops > ATR_STOPLOSS_K × ATR from average_cost
-             Safety net against catastrophic drops
+  RANGING       → Bollinger Band mean reversion
+                  BUY at lower band (SMA20 − 2σ), SELL at SMA20 (or above)
 
-Tranche size is sentiment-scaled:
-  SEVERE_FEAR → 0.5×  (capital preservation)
-  UNEASE      → 0.75×
-  NEUTRAL     → 1.0×
-  HYPE        → 1.2×  (higher conviction)
+  TRENDING_UP   → ATR Breakout (momentum)
+                  BUY when one-tick delta > ATR_BREAKOUT_K × ATR
+                  SELL at BREAKOUT_TP_MULT above entry
 
-ATR uses Wilder's smoothing (same as all other strategies).
+  TRENDING_DOWN → DCA Tranches (cost-averaging into the decline)
+  UNCLEAR       → DCA Tranches with 0.5× reduced sizing (conservative)
+
+Regime Detection — majority vote, 2 of 3 indicators must agree:
+  ATR%       = ATR / price              trending > 0.5%,   ranging < 0.2%
+  BB width   = (upper−lower) / SMA20   trending > 2%,     ranging < 1%
+  Price dev  = |price − SMA50| / SMA50  trending > 2%,     ranging < 1%
+
+Regime dwell: a new regime must persist for REGIME_DWELL_TICKS consecutive ticks
+before the engine commits to it, preventing whipsawing on noisy signals.
+
+Position Sizing — volatility-targeted:
+  qty = RISK_PER_TRADE_USD × scalar / ATR  (capped at allocation / price)
+  Sentiment scalar:  SEVERE_FEAR 0.5×, UNEASE 0.75×, NEUTRAL 1.0×, HYPE 1.2×
+  Sharpe scalar:     clamp(0.9 + rolling_sharpe × 0.6, 0.3, 1.5)
+  Combined, sizing automatically shrinks in high-volatility or losing streaks
+  and expands in low-volatility profitable periods — up to the allocation cap.
+
+Exit logic uses the regime at entry (not the current regime) so a position
+opened in one mode isn't prematurely closed by a different mode's threshold.
+ATR stop-loss is regime-agnostic and always has highest priority.
 
 Subscribes to:
-    market_data       — mid_price ticks (filtered to TRADE_SYMBOL only)
+    market_data       — mid_price ticks (filtered to SOL/USD only)
     sentiment_signals — global NLP compound score
 
 Publishes to:
@@ -41,6 +54,7 @@ import logging
 import math
 import os
 import signal
+import statistics
 import sys
 import time
 from collections import deque
@@ -52,7 +66,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Channels & Symbol ──────────────────────────────────────────────────────────
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
@@ -64,26 +78,52 @@ EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 TRADE_SYMBOL       = "SOL/USD"
 DEFAULT_ORDER_TYPE = "MARKET"
 
-# DCA strategy parameters.
-PROFIT_MARGIN   = float(os.getenv("SOL_DCA_PROFIT_MARGIN",  "0.02"))   # 2% take-profit above avg cost
-INITIAL_DIP_PCT = float(os.getenv("SOL_DCA_INITIAL_DIP",    "0.01"))   # 1% below SMA for first tranche
-TRANCHE_DIP_PCT = float(os.getenv("SOL_DCA_TRANCHE_DIP",    "0.015"))  # 1.5% below last buy for next
-MAX_TRANCHES    = int(os.getenv("SOL_DCA_MAX_TRANCHES",      "5"))
-SMA_PERIOD      = int(os.getenv("SOL_DCA_SMA_PERIOD",        "20"))
-SENTIMENT_GATE  = float(os.getenv("SOL_DCA_SENTIMENT_GATE",  "-0.30"))
+# ── ATR (shared across all modes) ─────────────────────────────────────────────
+ATR_PERIOD     = int(os.getenv("SOL_ATR_PERIOD",               "14"))
+ATR_STOPLOSS_K = float(os.getenv("SOL_ATR_STOPLOSS_K",         "2.0"))
+FALLBACK_STOP  = float(os.getenv("SOL_FALLBACK_STOP_MULTIPLIER", "0.95"))
 
-# Sentiment scalars for tranche sizing — mirrors BTC/ETH strategy regime thresholds.
+# ── Regime Detection ──────────────────────────────────────────────────────────
+ATR_PCT_TRENDING   = float(os.getenv("SOL_ATR_PCT_TRENDING",   "0.005"))  # 0.5%
+ATR_PCT_RANGING    = float(os.getenv("SOL_ATR_PCT_RANGING",    "0.002"))  # 0.2%
+BB_WIDTH_TRENDING  = float(os.getenv("SOL_BB_WIDTH_TRENDING",  "0.02"))   # 2%
+BB_WIDTH_RANGING   = float(os.getenv("SOL_BB_WIDTH_RANGING",   "0.01"))   # 1%
+PRICE_DEV_TRENDING = float(os.getenv("SOL_PRICE_DEV_TRENDING", "0.02"))   # 2%
+PRICE_DEV_RANGING  = float(os.getenv("SOL_PRICE_DEV_RANGING",  "0.01"))   # 1%
+REGIME_DWELL_TICKS = int(os.getenv("SOL_REGIME_DWELL_TICKS",  "120"))     # ~10 min at 5s/tick
+
+SMA_PERIOD   = int(os.getenv("SOL_SMA_PERIOD", "20"))
+SMA50_PERIOD = 50   # fixed; used as trend-direction anchor
+BB_STD_MULT  = float(os.getenv("SOL_BB_STD_MULT", "2.0"))
+
+# Minimum ticks before any signal — need SMA50 to be valid.
+WARMUP_TICKS = SMA50_PERIOD
+
+# ── RANGING: Bollinger Band Mean Reversion ────────────────────────────────────
+BB_PROFIT_MARGIN = float(os.getenv("SOL_BB_PROFIT_MARGIN", "0.005"))  # 0.5% min gain at exit
+
+# ── TRENDING_UP: ATR Breakout ─────────────────────────────────────────────────
+ATR_BREAKOUT_K   = float(os.getenv("SOL_ATR_BREAKOUT_K",   "2.0"))
+BREAKOUT_TP_MULT = float(os.getenv("SOL_BREAKOUT_TP_MULT", "1.05"))  # +5%
+
+# ── TRENDING_DOWN / UNCLEAR: DCA Tranches ────────────────────────────────────
+PROFIT_MARGIN   = float(os.getenv("SOL_DCA_PROFIT_MARGIN", "0.02"))   # 2% TP
+INITIAL_DIP_PCT = float(os.getenv("SOL_DCA_INITIAL_DIP",   "0.01"))   # 1% below SMA20
+TRANCHE_DIP_PCT = float(os.getenv("SOL_DCA_TRANCHE_DIP",   "0.015"))  # 1.5% below last buy
+MAX_TRANCHES    = int(os.getenv("SOL_DCA_MAX_TRANCHES",     "5"))
+SENTIMENT_GATE  = float(os.getenv("SOL_DCA_SENTIMENT_GATE", "-0.30"))
+
+# ── Position Sizing ───────────────────────────────────────────────────────────
 SENTIMENT_SCALAR_SEVERE_FEAR = float(os.getenv("SOL_DCA_SCALAR_SEVERE_FEAR", "0.5"))
 SENTIMENT_SCALAR_UNEASE      = float(os.getenv("SOL_DCA_SCALAR_UNEASE",      "0.75"))
 SENTIMENT_SCALAR_NEUTRAL     = float(os.getenv("SOL_DCA_SCALAR_NEUTRAL",     "1.0"))
 SENTIMENT_SCALAR_HYPE        = float(os.getenv("SOL_DCA_SCALAR_HYPE",        "1.2"))
 
-# ATR stop-loss — safety net for catastrophic drawdowns.
-ATR_PERIOD      = int(os.getenv("SOL_ATR_PERIOD",               "14"))
-ATR_STOPLOSS_K  = float(os.getenv("SOL_ATR_STOPLOSS_K",          "2.0"))
-FALLBACK_STOP   = float(os.getenv("SOL_FALLBACK_STOP_MULTIPLIER", "0.95"))  # 5% fixed fallback
+# Dollar risk per ATR move: qty = RISK_PER_TRADE_USD × scalar / ATR
+RISK_PER_TRADE_USD = float(os.getenv("SOL_RISK_PER_TRADE_USD", "2000.0"))
+SHARPE_WINDOW      = int(os.getenv("SOL_SHARPE_WINDOW",        "10"))
 
-# Portfolio sizing — SOL gets 20% of portfolio.
+# ── Portfolio ─────────────────────────────────────────────────────────────────
 PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",  "1000000"))
 SOL_ALLOCATION   = float(os.getenv("SOL_ALLOCATION", "0.20"))
 TARGET_ORDER_USD = PORTFOLIO_USD * SOL_ALLOCATION
@@ -104,37 +144,50 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Strategy State ─────────────────────────────────────────────────────────────
-# SMA window for initial dip detection
-sma_prices: deque[float] = deque(maxlen=SMA_PERIOD)
-
-# ATR state for stop-loss
+# ── ATR State ─────────────────────────────────────────────────────────────────
 atr_true_ranges: deque[float] = deque(maxlen=ATR_PERIOD)
-atr_value: float       = 0.0
-atr_initialized: bool  = False
-last_atr_price: float | None = None
+atr_value:       float        = 0.0
+atr_initialized: bool         = False
+last_atr_price:  float | None = None
 
-# Sentiment
+# ── Price Windows ─────────────────────────────────────────────────────────────
+sma_prices:   deque[float] = deque(maxlen=SMA_PERIOD)    # SMA20 / BB window
+sma50_prices: deque[float] = deque(maxlen=SMA50_PERIOD)  # SMA50 for regime direction
+
+# ── Regime ────────────────────────────────────────────────────────────────────
+current_regime:   str = "UNCLEAR"   # committed regime
+candidate_regime: str = "UNCLEAR"   # regime accumulating dwell ticks
+candidate_ticks:  int = 0           # how many consecutive ticks candidate has held
+
+# ── Sentiment ─────────────────────────────────────────────────────────────────
 global_sentiment_score: float = 0.0
 
-# Position state
-in_position: bool           = False
-open_position_quantity: str = "0.0000"
-average_cost: float         = 0.0   # weighted average cost across all tranches
-atr_at_entry: float         = 0.0   # ATR snapshot at first entry — stop-loss anchor
+# ── Position ──────────────────────────────────────────────────────────────────
+in_position:            bool  = False
+open_position_quantity: str   = "0.0000"
+average_cost:           float = 0.0
+atr_at_entry:           float = 0.0
+entry_regime:           str   = ""   # regime under which the position was opened
 
-# DCA tranche tracking
-tranche_count: int    = 0     # number of tranches bought
-last_buy_price: float = 0.0   # price of last confirmed BUY — anchor for next dip
+# ── DCA State ─────────────────────────────────────────────────────────────────
+tranche_count: int   = 0
+last_buy_price: float = 0.0
 
-# Execution handshake
-pending_action: str | None  = None
-pending_action_since: float = 0.0
-pending_sell_quantity: str  = "0.0000"
-cooldown_until: float       = 0.0
+# ── Rolling Sharpe ────────────────────────────────────────────────────────────
+trade_returns:     deque[float] = deque(maxlen=SHARPE_WINDOW)
+pending_sell_price: float       = 0.0   # price at time of SELL signal for return calc
 
-# Startup guards
-boot_liquidation_done: bool    = False
+# ── Breakout: previous tick price for delta ───────────────────────────────────
+prev_price: float | None = None
+
+# ── Execution Handshake ───────────────────────────────────────────────────────
+pending_action:       str | None = None
+pending_action_since: float      = 0.0
+pending_sell_quantity: str       = "0.0000"
+cooldown_until:       float      = 0.0
+
+# ── Startup Guards ────────────────────────────────────────────────────────────
+boot_liquidation_done:    bool = False
 boot_liquidation_pending: bool = False
 
 STATE_KEY = f"strategy_state:{TRADE_SYMBOL}"
@@ -150,9 +203,8 @@ signal.signal(signal.SIGINT,  _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
-# ── ATR Computation (Wilder's Smoothing) ───────────────────────────────────────
+# ── ATR (Wilder's Smoothing) ───────────────────────────────────────────────────
 def _compute_atr(current_price: float) -> float | None:
-    """Update ATR state and return current value, or None while still seeding."""
     global atr_value, atr_initialized, last_atr_price
 
     if last_atr_price is None:
@@ -175,33 +227,117 @@ def _compute_atr(current_price: float) -> float | None:
     return atr_value
 
 
-def _target_quantity(price: float) -> str:
-    """Floor-divide full target notional by price to whole units."""
-    if price <= 0:
-        return "0"
-    qty = int(math.floor(TARGET_ORDER_USD / price))
-    return str(qty)
-
-
+# ── Sizing Helpers ────────────────────────────────────────────────────────────
 def _sentiment_scalar() -> float:
-    """Map current sentiment score to a tranche size multiplier."""
-    score = global_sentiment_score
-    if score < -0.30:
-        return SENTIMENT_SCALAR_SEVERE_FEAR
-    if score < -0.05:
-        return SENTIMENT_SCALAR_UNEASE
-    if score <= 0.25:
-        return SENTIMENT_SCALAR_NEUTRAL
+    s = global_sentiment_score
+    if s < -0.30: return SENTIMENT_SCALAR_SEVERE_FEAR
+    if s < -0.05: return SENTIMENT_SCALAR_UNEASE
+    if s <= 0.25: return SENTIMENT_SCALAR_NEUTRAL
     return SENTIMENT_SCALAR_HYPE
 
 
-def _tranche_quantity(price: float) -> str:
-    """One tranche = (TARGET_ORDER_USD / MAX_TRANCHES) × sentiment_scalar, in whole units."""
+def _sharpe_scalar() -> float:
+    """Scale by rolling Sharpe of last SHARPE_WINDOW closed trades. Range: [0.3, 1.5]."""
+    if len(trade_returns) < 3:
+        return 1.0
+    try:
+        mu  = statistics.mean(trade_returns)
+        sig = statistics.stdev(trade_returns)
+    except statistics.StatisticsError:
+        return 1.0
+    if sig < 1e-8:
+        return 1.0 if mu >= 0 else 0.3
+    return max(0.3, min(1.5, 0.9 + (mu / sig) * 0.6))
+
+
+def _sized_quantity(price: float, max_alloc_usd: float) -> str:
+    """
+    Volatility-targeted size capped at max_alloc_usd / price.
+
+    qty = RISK_PER_TRADE_USD × scalar / ATR  (dollars-at-risk per ATR move)
+    Capped at allocation cap = max_alloc_usd × scalar / price.
+    Falls back to cap-only when ATR is not yet seeded.
+    """
     if price <= 0:
         return "0"
-    tranche_usd = (TARGET_ORDER_USD / MAX_TRANCHES) * _sentiment_scalar()
-    qty = int(math.floor(tranche_usd / price))
-    return str(qty)
+    scalar    = _sentiment_scalar() * _sharpe_scalar()
+    alloc_qty = int(math.floor(max_alloc_usd * scalar / price))
+    if atr_value > 0:
+        risk_qty = int(math.floor(RISK_PER_TRADE_USD * scalar / atr_value))
+        qty = min(risk_qty, alloc_qty)
+    else:
+        qty = alloc_qty
+    return str(max(qty, 0))
+
+
+# ── Bollinger Bands ───────────────────────────────────────────────────────────
+def _bollinger_bands(sma: float) -> tuple[float, float]:
+    """Compute (upper, lower) from the SMA20 window."""
+    if len(sma_prices) < SMA_PERIOD:
+        return sma, sma
+    variance = sum((p - sma) ** 2 for p in sma_prices) / len(sma_prices)
+    std = math.sqrt(variance)
+    return sma + BB_STD_MULT * std, sma - BB_STD_MULT * std
+
+
+# ── Regime Detection ──────────────────────────────────────────────────────────
+def _detect_regime(price: float, sma20: float, sma50: float) -> str:
+    """
+    Classify current market regime using a 2-of-3 majority vote.
+
+    Returns: TRENDING_UP, TRENDING_DOWN, RANGING, or UNCLEAR.
+    """
+    if price <= 0 or sma20 <= 0 or sma50 <= 0 or atr_value <= 0:
+        return "UNCLEAR"
+
+    atr_pct   = atr_value / price
+    bb_u, bb_l = _bollinger_bands(sma20)
+    bb_width  = (bb_u - bb_l) / sma20 if sma20 > 0 else 0
+    price_dev = abs(price - sma50) / sma50
+
+    t = 0  # trending votes
+    r = 0  # ranging votes
+
+    if   atr_pct  > ATR_PCT_TRENDING:    t += 1
+    elif atr_pct  < ATR_PCT_RANGING:     r += 1
+    if   bb_width > BB_WIDTH_TRENDING:   t += 1
+    elif bb_width < BB_WIDTH_RANGING:    r += 1
+    if   price_dev > PRICE_DEV_TRENDING: t += 1
+    elif price_dev < PRICE_DEV_RANGING:  r += 1
+
+    if t >= 2:
+        return "TRENDING_UP" if price >= sma50 else "TRENDING_DOWN"
+    if r >= 2:
+        return "RANGING"
+    return "UNCLEAR"
+
+
+def _update_regime(detected: str) -> None:
+    """
+    Apply dwell filter: commit to a new regime only after REGIME_DWELL_TICKS
+    consecutive ticks of the same new signal.
+    """
+    global current_regime, candidate_regime, candidate_ticks
+
+    if detected == current_regime:
+        # Already in this regime — reset candidate
+        candidate_regime = detected
+        candidate_ticks  = 0
+        return
+
+    if detected == candidate_regime:
+        candidate_ticks += 1
+        if candidate_ticks >= REGIME_DWELL_TICKS:
+            log.info(
+                "Regime committed: %s → %s (held for %d ticks)",
+                current_regime, detected, candidate_ticks,
+            )
+            current_regime   = detected
+            candidate_ticks  = 0
+    else:
+        # New candidate — start fresh dwell count
+        candidate_regime = detected
+        candidate_ticks  = 1
 
 
 # ── State Persistence ──────────────────────────────────────────────────────────
@@ -215,6 +351,7 @@ async def _save_state(redis_client: aioredis.Redis) -> None:
             "cooldown_until":         str(cooldown_until),
             "tranche_count":          str(tranche_count),
             "last_buy_price":         str(last_buy_price),
+            "entry_regime":           entry_regime,
         })
     except aioredis.RedisError as exc:
         log.warning("Failed to persist state: %s", exc)
@@ -222,40 +359,43 @@ async def _save_state(redis_client: aioredis.Redis) -> None:
 
 async def _load_state(redis_client: aioredis.Redis) -> bool:
     global in_position, open_position_quantity, average_cost, atr_at_entry
-    global cooldown_until, tranche_count, last_buy_price
+    global cooldown_until, tranche_count, last_buy_price, entry_regime
+
     try:
         state = await redis_client.hgetall(STATE_KEY)
     except aioredis.RedisError as exc:
         log.warning("Failed to load persisted state: %s", exc)
         return False
+
     if not state or state.get("in_position") is None:
         return False
+
     in_position            = state.get("in_position", "False") == "True"
     open_position_quantity = state.get("open_position_quantity", "0")
-    average_cost           = float(state.get("average_cost",    "0.0"))
-    atr_at_entry           = float(state.get("atr_at_entry",    "0.0"))
-    cooldown_until         = float(state.get("cooldown_until",  "0.0"))
-    tranche_count          = int(float(state.get("tranche_count",  "0")))
-    last_buy_price         = float(state.get("last_buy_price",  "0.0"))
+    average_cost           = float(state.get("average_cost",   "0.0"))
+    atr_at_entry           = float(state.get("atr_at_entry",   "0.0"))
+    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    tranche_count          = int(float(state.get("tranche_count", "0")))
+    last_buy_price         = float(state.get("last_buy_price", "0.0"))
+    entry_regime           = state.get("entry_regime", "")
 
-    # Migration shim: old state used entry_price — promote it to average_cost.
+    # Migration: old state may have entry_price instead of average_cost
     if in_position and average_cost == 0.0:
         legacy = float(state.get("entry_price", "0.0"))
         if legacy > 0:
             average_cost = legacy
             log.warning("Migrated legacy entry_price=%.4f to average_cost.", average_cost)
 
-    # Defensive: if not in position, tranche state must be clean.
     if not in_position:
         tranche_count  = 0
         last_buy_price = 0.0
         average_cost   = 0.0
 
     log.info(
-        "Resumed persisted state: in_position=%s qty=%s avg_cost=%.4f "
-        "tranches=%d last_buy=%.4f atr_entry=%.6f",
+        "Resumed state: in_position=%s qty=%s avg_cost=%.4f "
+        "tranches=%d last_buy=%.4f atr_entry=%.6f entry_regime=%s",
         in_position, open_position_quantity, average_cost,
-        tranche_count, last_buy_price, atr_at_entry,
+        tranche_count, last_buy_price, atr_at_entry, entry_regime,
     )
     return True
 
@@ -283,7 +423,7 @@ async def _publish_signal(
     try:
         await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
         log.info(
-            "Signal published → action=%s symbol=%s qty=%s reason=%s px=%.6f",
+            "Signal → action=%s symbol=%s qty=%s reason=%s px=%.6f",
             action, symbol, quantity, reason, expected_price,
         )
     except aioredis.RedisError as exc:
@@ -298,199 +438,222 @@ async def evaluate_market_tick(
     timestamp: int,
     redis_client: aioredis.Redis,
 ) -> None:
-    global average_cost, tranche_count, last_buy_price, atr_at_entry
+    global average_cost, tranche_count, last_buy_price, atr_at_entry, entry_regime
     global pending_action, pending_action_since, in_position, open_position_quantity
-    global cooldown_until, pending_sell_quantity
-    global boot_liquidation_pending
+    global cooldown_until, pending_sell_quantity, pending_sell_price
+    global boot_liquidation_pending, prev_price
 
-    # Guard: only process ticks for this strategy's symbol.
-    if symbol != TRADE_SYMBOL:
+    if symbol != TRADE_SYMBOL or price <= 0:
         return
 
-    # Guard: zero/negative prices cause division errors.
-    if price <= 0:
-        return
-
-    # ── ATR update ───────────────────────────────────────────────────────────
-    current_atr = _compute_atr(price)
-
-    # ── SMA update ───────────────────────────────────────────────────────────
+    # ATR + price window updates
+    _compute_atr(price)
     sma_prices.append(price)
+    sma50_prices.append(price)
 
-    # ── SMA warm-up ──────────────────────────────────────────────────────────
-    if len(sma_prices) < SMA_PERIOD:
-        log.info("SMA warm-up: %d/%d prices.", len(sma_prices), SMA_PERIOD)
+    # Warm-up: SMA50 must be fully seeded before regime detection is valid
+    if len(sma50_prices) < WARMUP_TICKS:
+        log.info("Warm-up: %d/%d ticks for SMA50.", len(sma50_prices), WARMUP_TICKS)
+        prev_price = price
         return
 
-    sma    = sum(sma_prices) / SMA_PERIOD
+    sma20 = sum(sma_prices) / len(sma_prices)
+    sma50 = sum(sma50_prices) / SMA50_PERIOD
+
+    # Detect regime and apply dwell filter
+    detected = _detect_regime(price, sma20, sma50)
+    _update_regime(detected)
+
+    bb_upper, bb_lower = _bollinger_bands(sma20)
     now_ts = time.time()
-    state  = "IN_POSITION" if in_position else "OUT_OF_POSITION"
-    tp_price = average_cost * (1.0 + PROFIT_MARGIN) if average_cost > 0 else 0.0
 
     log.info(
-        "px=%.6f | SMA=%.6f | avg_cost=%.6f | tranches=%d/%d | ATR=%.6f | "
-        "senti=%.4f (%.2f×) | %s | tp=%.6f | cooldown=%.0fs",
-        price, sma, average_cost, tranche_count, MAX_TRANCHES,
-        current_atr if current_atr else 0.0,
-        global_sentiment_score, _sentiment_scalar(),
-        state, tp_price,
-        max(cooldown_until - now_ts, 0.0),
+        "px=%.4f | SMA20=%.4f | SMA50=%.4f | BB[%.4f/%.4f] | "
+        "regime=%s(cand=%s %dt) | avg=%.4f | tr=%d/%d | ATR=%.6f | "
+        "senti=%.4f(%.2f×s %.2f×sh) | %s",
+        price, sma20, sma50, bb_upper, bb_lower,
+        current_regime, candidate_regime, candidate_ticks,
+        average_cost, tranche_count, MAX_TRANCHES,
+        atr_value,
+        global_sentiment_score, _sentiment_scalar(), _sharpe_scalar(),
+        "IN" if in_position else "OUT",
     )
 
-    # ── Suppress while pending ────────────────────────────────────────────────
+    # Pending confirmation timeout
     if pending_action is not None:
         if time.time() - pending_action_since > CONFIRMATION_TIMEOUT_SEC:
-            log.warning(
-                "Pending %s confirmation timed out after %.0fs — resetting.",
-                pending_action, CONFIRMATION_TIMEOUT_SEC,
-            )
+            log.warning("Pending %s timed out — resetting.", pending_action)
             pending_action = None
         else:
-            log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
+            prev_price = price
             return
 
     if boot_liquidation_pending:
-        log.info("Signal suppressed: awaiting startup liquidation.")
+        prev_price = price
         return
 
-    # ── Entry: First Tranche ──────────────────────────────────────────────────
-    if (
-        not in_position
-        and tranche_count == 0
-        and now_ts > cooldown_until
-        and price <= sma * (1.0 - INITIAL_DIP_PCT)
-        and global_sentiment_score > SENTIMENT_GATE
-    ):
-        quantity = _tranche_quantity(price)
-        if int(quantity) <= 0:
-            log.warning("First tranche quantity rounds to 0 at price=%.6f — skipping.", price)
-            return
-        pending_action       = "BUY"
-        pending_action_since = time.time()
-        # Provisional average_cost — updated on confirmation with actual fill price.
-        average_cost         = price
-        last_buy_price       = price
-        atr_at_entry         = current_atr if current_atr and current_atr > 0 else 0.0
-        await _publish_signal(
-            redis_client,
-            action="BUY",
-            symbol=symbol,
-            quantity=quantity,
-            reason=(
-                f"DCA_Tranche1_dip={INITIAL_DIP_PCT*100:.1f}pct"
-                f"_sma={sma:.4f}_senti={global_sentiment_score:.3f}"
-                f"_scalar={_sentiment_scalar():.2f}x"
-            ),
-            timestamp=timestamp,
-            expected_price=price,
+    # ── EXITS (highest priority, regime-agnostic) ─────────────────────────────
+    if in_position:
+        # 1. ATR stop-loss
+        stop_price = (
+            average_cost - ATR_STOPLOSS_K * atr_at_entry
+            if atr_at_entry > 0
+            else average_cost * FALLBACK_STOP
         )
-        return
-
-    # ── Entry: Additional Tranches ────────────────────────────────────────────
-    if (
-        in_position
-        and tranche_count < MAX_TRANCHES
-        and last_buy_price > 0
-        and price <= last_buy_price * (1.0 - TRANCHE_DIP_PCT)
-        and now_ts > cooldown_until
-        and global_sentiment_score > SENTIMENT_GATE
-    ):
-        quantity = _tranche_quantity(price)
-        if int(quantity) <= 0:
-            log.warning(
-                "Tranche %d quantity rounds to 0 at price=%.6f — skipping.",
-                tranche_count + 1, price,
-            )
-            # Fall through to exit checks.
-        else:
-            pending_action       = "BUY"
-            pending_action_since = time.time()
-            last_buy_price       = price   # provisional; confirmed in handler
+        if price <= stop_price:
+            sell_qty              = open_position_quantity
+            pending_action        = "SELL"
+            pending_action_since  = time.time()
+            pending_sell_quantity = sell_qty
+            pending_sell_price    = price
+            cooldown_until        = now_ts + COOLDOWN_SECONDS
             await _publish_signal(
-                redis_client,
-                action="BUY",
-                symbol=symbol,
-                quantity=quantity,
-                reason=(
-                    f"DCA_Tranche{tranche_count + 1}_dip={TRANCHE_DIP_PCT*100:.1f}pct"
-                    f"_last={last_buy_price:.4f}_senti={global_sentiment_score:.3f}"
-                    f"_scalar={_sentiment_scalar():.2f}x"
-                ),
-                timestamp=timestamp,
-                expected_price=price,
+                redis_client, action="SELL", symbol=symbol, quantity=sell_qty,
+                reason=f"ATR_StopLoss_{ATR_STOPLOSS_K}x_entry_regime={entry_regime}",
+                timestamp=timestamp, expected_price=price,
             )
+            log.warning(
+                "ATR stop: px=%.4f stop=%.4f avg=%.4f entry_regime=%s tranches=%d",
+                price, stop_price, average_cost, entry_regime, tranche_count,
+            )
+            prev_price = price
             return
 
-    # No exits to evaluate if flat.
-    if not in_position:
+        # 2. Take-profit — threshold depends on the regime under which we entered
+        if entry_regime == "RANGING":
+            take_profit = max(sma20, average_cost * (1.0 + BB_PROFIT_MARGIN))
+            tp_reason   = f"BB_MeanReversion_exit_sma={sma20:.4f}_avg={average_cost:.4f}"
+        elif entry_regime == "TRENDING_UP":
+            take_profit = average_cost * BREAKOUT_TP_MULT
+            tp_reason   = f"Breakout_TakeProfit_{int((BREAKOUT_TP_MULT - 1) * 100)}pct_avg={average_cost:.4f}"
+        else:
+            take_profit = average_cost * (1.0 + PROFIT_MARGIN)
+            tp_reason   = f"DCA_TakeProfit_{int(PROFIT_MARGIN * 100)}pct_avg={average_cost:.4f}_tr={tranche_count}"
+
+        if price >= take_profit:
+            sell_qty              = open_position_quantity
+            pending_action        = "SELL"
+            pending_action_since  = time.time()
+            pending_sell_quantity = sell_qty
+            pending_sell_price    = price
+            await _publish_signal(
+                redis_client, action="SELL", symbol=symbol, quantity=sell_qty,
+                reason=tp_reason, timestamp=timestamp, expected_price=price,
+            )
+            prev_price = price
+            return
+
+        # 3. DCA additional tranches (only relevant for DCA entry modes)
+        if (
+            entry_regime in ("TRENDING_DOWN", "UNCLEAR", "")
+            and tranche_count < MAX_TRANCHES
+            and last_buy_price > 0
+            and price <= last_buy_price * (1.0 - TRANCHE_DIP_PCT)
+            and now_ts > cooldown_until
+            and global_sentiment_score > SENTIMENT_GATE
+        ):
+            unclear_adj = 0.5 if entry_regime == "UNCLEAR" else 1.0
+            alloc       = TARGET_ORDER_USD / MAX_TRANCHES
+            raw_qty     = int(_sized_quantity(price, alloc) or "0")
+            quantity    = str(int(raw_qty * unclear_adj))
+            if int(quantity) > 0:
+                pending_action       = "BUY"
+                pending_action_since = time.time()
+                last_buy_price       = price
+                await _publish_signal(
+                    redis_client, action="BUY", symbol=symbol, quantity=quantity,
+                    reason=f"DCA_Tranche{tranche_count + 1}_dip={TRANCHE_DIP_PCT * 100:.1f}pct"
+                           f"_entry_regime={entry_regime}",
+                    timestamp=timestamp, expected_price=price,
+                )
+                prev_price = price
+                return
+
+        prev_price = price
         return
 
-    # Compute stop price from ATR captured at entry (or fallback).
-    if atr_at_entry > 0:
-        stop_loss_price = average_cost - (ATR_STOPLOSS_K * atr_at_entry)
+    # ── ENTRIES (not in position) ─────────────────────────────────────────────
+    if now_ts <= cooldown_until or global_sentiment_score <= SENTIMENT_GATE:
+        prev_price = price
+        return
+
+    # ── RANGING: Bollinger Band mean reversion ────────────────────────────────
+    if current_regime == "RANGING":
+        if price <= bb_lower:
+            quantity = _sized_quantity(price, TARGET_ORDER_USD / 2)
+            if int(quantity) > 0:
+                pending_action       = "BUY"
+                pending_action_since = time.time()
+                average_cost         = price
+                last_buy_price       = price
+                atr_at_entry         = atr_value
+                entry_regime         = "RANGING"
+                await _publish_signal(
+                    redis_client, action="BUY", symbol=symbol, quantity=quantity,
+                    reason=f"BB_MeanReversion_lower={bb_lower:.4f}_sma={sma20:.4f}",
+                    timestamp=timestamp, expected_price=price,
+                )
+                prev_price = price
+                return
+
+    # ── TRENDING_UP: ATR Breakout ─────────────────────────────────────────────
+    elif current_regime == "TRENDING_UP":
+        if prev_price is not None and atr_value > 0:
+            delta = price - prev_price
+            if delta > ATR_BREAKOUT_K * atr_value:
+                quantity = _sized_quantity(price, TARGET_ORDER_USD / 2)
+                if int(quantity) > 0:
+                    pending_action       = "BUY"
+                    pending_action_since = time.time()
+                    average_cost         = price
+                    last_buy_price       = price
+                    atr_at_entry         = atr_value
+                    entry_regime         = "TRENDING_UP"
+                    await _publish_signal(
+                        redis_client, action="BUY", symbol=symbol, quantity=quantity,
+                        reason=f"ATR_Breakout_{ATR_BREAKOUT_K}x_delta={delta:.4f}_atr={atr_value:.6f}",
+                        timestamp=timestamp, expected_price=price,
+                    )
+                    prev_price = price
+                    return
+
+    # ── TRENDING_DOWN / UNCLEAR: DCA first tranche ────────────────────────────
     else:
-        stop_loss_price = average_cost * FALLBACK_STOP
+        if price <= sma20 * (1.0 - INITIAL_DIP_PCT):
+            unclear_adj = 0.5 if current_regime == "UNCLEAR" else 1.0
+            alloc       = TARGET_ORDER_USD / MAX_TRANCHES
+            raw_qty     = int(_sized_quantity(price, alloc) or "0")
+            quantity    = str(int(raw_qty * unclear_adj))
+            if int(quantity) > 0:
+                pending_action       = "BUY"
+                pending_action_since = time.time()
+                average_cost         = price
+                last_buy_price       = price
+                atr_at_entry         = atr_value
+                entry_regime         = current_regime
+                await _publish_signal(
+                    redis_client, action="BUY", symbol=symbol, quantity=quantity,
+                    reason=f"DCA_Tranche1_dip={INITIAL_DIP_PCT * 100:.1f}pct_regime={current_regime}",
+                    timestamp=timestamp, expected_price=price,
+                )
+                prev_price = price
+                return
 
-    # ── Exit 1: ATR Stop-Loss ─────────────────────────────────────────────────
-    if price <= stop_loss_price:
-        sell_qty              = open_position_quantity
-        pending_action        = "SELL"
-        pending_action_since  = time.time()
-        pending_sell_quantity = sell_qty
-        cooldown_until        = now_ts + COOLDOWN_SECONDS
-        await _publish_signal(
-            redis_client,
-            action="SELL",
-            symbol=symbol,
-            quantity=sell_qty,
-            reason=f"ATR_StopLoss_{ATR_STOPLOSS_K}x",
-            timestamp=timestamp,
-            expected_price=price,
-        )
-        log.warning(
-            "ATR stop-loss triggered: px=%.6f avg_cost=%.6f stop=%.6f atr_entry=%.6f tranches=%d",
-            price, average_cost, stop_loss_price, atr_at_entry, tranche_count,
-        )
-        return
-
-    # ── Exit 2: Take-Profit ───────────────────────────────────────────────────
-    take_profit_price = average_cost * (1.0 + PROFIT_MARGIN)
-    if price >= take_profit_price:
-        sell_qty              = open_position_quantity
-        pending_action        = "SELL"
-        pending_action_since  = time.time()
-        pending_sell_quantity = sell_qty
-        await _publish_signal(
-            redis_client,
-            action="SELL",
-            symbol=symbol,
-            quantity=sell_qty,
-            reason=f"DCA_TakeProfit_{int(PROFIT_MARGIN*100)}pct_avg={average_cost:.4f}",
-            timestamp=timestamp,
-            expected_price=price,
-        )
-        log.info(
-            "DCA take-profit triggered: px=%.6f avg_cost=%.6f target=%.6f "
-            "gain=%.2f%% tranches=%d",
-            price, average_cost, take_profit_price,
-            (price / average_cost - 1.0) * 100, tranche_count,
-        )
-        return
+    prev_price = price
 
 
 # ── Execution Confirmation Handler ─────────────────────────────────────────────
 async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis.Redis) -> None:
     global in_position, open_position_quantity, pending_action, average_cost
-    global atr_at_entry, pending_sell_quantity, boot_liquidation_pending
-    global tranche_count, last_buy_price
+    global atr_at_entry, pending_sell_quantity, pending_sell_price, boot_liquidation_pending
+    global tranche_count, last_buy_price, entry_regime
 
     try:
         data = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
-        log.warning("Malformed execution confirmation skipped: %r | error: %s", raw_payload, exc)
+        log.warning("Malformed execution confirmation: %r | %s", raw_payload, exc)
         return
 
-    # Filter: ignore confirmations for other symbols.
     confirmed_symbol = str(data.get("symbol", ""))
     if confirmed_symbol and confirmed_symbol != TRADE_SYMBOL:
         return
@@ -502,7 +665,7 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
     if side not in {"BUY", "SELL"}:
         return
 
-    # ── Startup Liquidation Acknowledgment ───────────────────────────────────
+    # ── Startup Liquidation ────────────────────────────────────────────────────
     if boot_liquidation_pending and side == "SELL":
         if reason not in {
             "SYSTEM_REBOOT_LIQUIDATION",
@@ -510,7 +673,6 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
             "STARTUP_BALANCE_SYNC_CLEAR",
         }:
             return
-
         boot_liquidation_pending = False
         pending_action           = None
         pending_sell_quantity    = "0.0000"
@@ -520,32 +682,32 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         atr_at_entry             = 0.0
         tranche_count            = 0
         last_buy_price           = 0.0
+        entry_regime             = ""
         await _save_state(redis_client)
-        if result == "SUCCESS":
-            log.info("Startup liquidation completed for %s.", TRADE_SYMBOL)
-        else:
-            log.info("Startup liquidation skipped for %s (nothing held): result=%s", TRADE_SYMBOL, result)
+        log.info(
+            "Startup liquidation %s for %s.",
+            "completed" if result == "SUCCESS" else "skipped",
+            TRADE_SYMBOL,
+        )
         return
 
     if pending_action is None:
         return
 
     if side != pending_action:
-        log.info("Ignoring out-of-order fill: side=%s while pending=%s", side, pending_action)
+        log.info("Out-of-order fill ignored: side=%s pending=%s", side, pending_action)
         return
 
     if result != "SUCCESS":
-        log.warning("%s fill failed (result=%s). Reverting pending state.", side, result)
+        log.warning("%s fill failed (result=%s). Reverting.", side, result)
         if side == "BUY":
             if tranche_count == 0:
-                # First tranche failed — full revert.
                 in_position            = False
                 open_position_quantity = "0.0000"
                 average_cost           = 0.0
                 atr_at_entry           = 0.0
                 last_buy_price         = 0.0
-            # For nth tranche failures, preserve the existing position — tranche_count
-            # is NOT incremented on failure, so state remains consistent.
+                entry_regime           = ""
         elif side == "SELL":
             in_position = True
             if open_position_quantity in {"", "0", "0.0", "0.0000"}:
@@ -564,21 +726,19 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         if net_qty > 0:
             prev_qty      = int(float(open_position_quantity)) if in_position else 0
             new_total_qty = prev_qty + net_qty
-            # Weighted average cost update.
-            buy_price    = last_buy_price if last_buy_price > 0 else average_cost
-            average_cost = (average_cost * prev_qty + buy_price * net_qty) / new_total_qty
+            buy_price     = last_buy_price if last_buy_price > 0 else average_cost
+            average_cost  = (average_cost * prev_qty + buy_price * net_qty) / new_total_qty
             open_position_quantity = str(new_total_qty)
-            in_position   = True
+            in_position    = True
             tranche_count += 1
             last_buy_price = buy_price
         pending_sell_quantity = "0"
         pending_action        = None
         await _save_state(redis_client)
         log.info(
-            "BUY confirmed (tranche %d/%d): executed=%.8f net_qty=%d "
-            "total_qty=%s avg_cost=%.6f last_buy=%.6f",
+            "BUY confirmed (tranche %d/%d): executed=%.4f net=%d total=%s avg=%.4f entry_regime=%s",
             tranche_count, MAX_TRANCHES,
-            executed_qty, net_qty, open_position_quantity, average_cost, last_buy_price,
+            executed_qty, net_qty, open_position_quantity, average_cost, entry_regime,
         )
 
     elif side == "SELL":
@@ -591,15 +751,27 @@ async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis
         in_position            = remaining > 0
         open_position_quantity = f"{remaining:.4f}"
         pending_sell_quantity  = "0.0000"
+
         if remaining <= 0.0:
-            average_cost   = 0.0
-            atr_at_entry   = 0.0
-            tranche_count  = 0
-            last_buy_price = 0.0
+            # Record trade return for rolling Sharpe
+            if average_cost > 0 and pending_sell_price > 0:
+                trade_return = (pending_sell_price - average_cost) / average_cost
+                trade_returns.append(trade_return)
+                log.info(
+                    "Trade return recorded: %.4f%% | Sharpe scalar now %.2f×",
+                    trade_return * 100, _sharpe_scalar(),
+                )
+            average_cost       = 0.0
+            atr_at_entry       = 0.0
+            tranche_count      = 0
+            last_buy_price     = 0.0
+            pending_sell_price = 0.0
+            entry_regime       = ""
+
         pending_action = None
         await _save_state(redis_client)
         log.info(
-            "SELL confirmed: executed=%.8f remaining_qty=%s tranches_reset=%s",
+            "SELL confirmed: executed=%.4f remaining=%s reset=%s",
             executed_qty, open_position_quantity, remaining <= 0.0,
         )
 
@@ -612,14 +784,15 @@ def handle_sentiment_update(raw_payload: str) -> None:
         data  = json.loads(raw_payload)
         score = float(data.get("compound_score", 0.0))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        log.warning("Malformed sentiment payload skipped: %r | error: %s", raw_payload, exc)
+        log.warning("Malformed sentiment payload: %r | %s", raw_payload, exc)
         return
 
-    prev               = global_sentiment_score
+    prev                   = global_sentiment_score
     global_sentiment_score = score
     log.info(
-        "Global sentiment updated: %.4f → %.4f | gate=%.2f | scalar=%.2f×",
-        prev, global_sentiment_score, SENTIMENT_GATE, _sentiment_scalar(),
+        "Sentiment: %.4f → %.4f | gate=%.2f | senti_scalar=%.2f× | sharpe_scalar=%.2f×",
+        prev, global_sentiment_score, SENTIMENT_GATE,
+        _sentiment_scalar(), _sharpe_scalar(),
     )
 
 
@@ -659,26 +832,18 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
 
             if channel == SENTIMENT_CHANNEL:
                 handle_sentiment_update(payload)
-                continue
-
-            if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
+            elif channel == EXECUTION_CONFIRMATIONS_CHANNEL:
                 await handle_execution_confirmation(payload, redis_client)
-                continue
-
-            if channel == MARKET_DATA_CHANNEL:
+            elif channel == MARKET_DATA_CHANNEL:
                 try:
                     tick      = json.loads(payload)
                     price     = float(tick["mid_price"])
                     timestamp = int(tick.get("timestamp", time.time()))
                     symbol    = str(tick.get("symbol", TRADE_SYMBOL))
                 except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    log.warning(
-                        "Malformed market_data payload skipped: %r | error: %s", payload, exc,
-                    )
+                    log.warning("Malformed market_data skipped: %r | %s", payload, exc)
                     continue
-
                 await evaluate_market_tick(price, symbol, timestamp, redis_client)
-
     finally:
         await pubsub.unsubscribe(
             MARKET_DATA_CHANNEL,
@@ -692,7 +857,7 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
 async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
     global in_position, open_position_quantity, pending_action, average_cost
     global atr_at_entry, cooldown_until, pending_sell_quantity, boot_liquidation_pending
-    global tranche_count, last_buy_price
+    global tranche_count, last_buy_price, entry_regime
 
     payload = {
         "action":   "SELL",
@@ -704,7 +869,7 @@ async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
     try:
         await redis_client.publish(TRADE_SIGNALS_CHANNEL, json.dumps(payload))
     except aioredis.RedisError as exc:
-        log.error("Failed to publish startup liquidation signal: %s", exc)
+        log.error("Failed to publish startup liquidation: %s", exc)
         raise
 
     boot_liquidation_pending = True
@@ -717,7 +882,8 @@ async def initialize_clean_slate(redis_client: aioredis.Redis) -> None:
     pending_sell_quantity    = "0.0000"
     tranche_count            = 0
     last_buy_price           = 0.0
-    log.info("Startup clean-slate liquidation signal published for %s.", TRADE_SYMBOL)
+    entry_regime             = ""
+    log.info("Startup liquidation published for %s.", TRADE_SYMBOL)
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -725,14 +891,14 @@ async def run() -> None:
     global boot_liquidation_done
 
     log.info(
-        "SOL DCA Strategy starting | symbol=%s | "
-        "profit_margin=%.1f%% | initial_dip=%.1f%% | tranche_dip=%.1f%% | "
-        "max_tranches=%d | sma_period=%d | sentiment_gate=%.2f | "
-        "atr_period=%d | atr_stop_k=%.2f | target_notional=$%.2f (%.0f%% of $%.0f)",
+        "SOL Adaptive Multi-Regime Strategy starting | symbol=%s | "
+        "regimes=[RANGING→BB, TRENDING_UP→Breakout, TRENDING_DOWN→DCA, UNCLEAR→DCA×0.5] | "
+        "dwell_ticks=%d | risk_per_trade=$%.0f | sharpe_window=%d | "
+        "bb_profit=%.1f%% | breakout_tp=%.1f%% | dca_profit=%.1f%% | "
+        "target_notional=$%.0f (%.0f%% of $%.0f)",
         TRADE_SYMBOL,
-        PROFIT_MARGIN * 100, INITIAL_DIP_PCT * 100, TRANCHE_DIP_PCT * 100,
-        MAX_TRANCHES, SMA_PERIOD, SENTIMENT_GATE,
-        ATR_PERIOD, ATR_STOPLOSS_K,
+        REGIME_DWELL_TICKS, RISK_PER_TRADE_USD, SHARPE_WINDOW,
+        BB_PROFIT_MARGIN * 100, (BREAKOUT_TP_MULT - 1) * 100, PROFIT_MARGIN * 100,
         TARGET_ORDER_USD, SOL_ALLOCATION * 100, PORTFOLIO_USD,
     )
 
@@ -760,13 +926,10 @@ async def run() -> None:
             await consume_stream(redis_client)
 
         except aioredis.RedisError as exc:
-            log.error("Redis connection error: %s. Retrying in %ds.", exc, RETRY_DELAY_SEC)
+            log.error("Redis error: %s. Retrying in %ds.", exc, RETRY_DELAY_SEC)
             await asyncio.sleep(RETRY_DELAY_SEC)
         except Exception as exc:
-            log.error(
-                "Unexpected error in SOL strategy run loop: %s. Retrying in %ds.",
-                exc, RETRY_DELAY_SEC,
-            )
+            log.error("Unexpected error: %s. Retrying in %ds.", exc, RETRY_DELAY_SEC)
             await asyncio.sleep(RETRY_DELAY_SEC)
         finally:
             if redis_client is not None:

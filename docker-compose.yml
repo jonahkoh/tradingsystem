@@ -25,13 +25,14 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis       # override localhost → docker service name
+      TRADE_SYMBOLS: BTC/USD,ETH/USD,SOL/USD,XRP/USD,FET/USD
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Process B — Strategy Engine ───────────────────────────────────────────────
-  strategy-engine:
+  # ── Process B — BTC Strategy Engine ───────────────────────────────────────────
+  btc-strategy-engine:
     build:
       context: .
       dockerfile: services/strategy-engine/Dockerfile
@@ -39,6 +40,7 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      STRATEGY_FILE: btc_eth_strategy_engine.py
     depends_on:
       redis:
         condition: service_healthy
@@ -53,9 +55,13 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      LOG_DIR: /data/logs
+      LOG_FILE: /data/logs/execution_log.csv
     depends_on:
       redis:
         condition: service_healthy
+    volumes:
+      - ./data:/data
     restart: unless-stopped
 
   # ── Process D — Ledger & Risk Monitor ─────────────────────────────────────────
@@ -110,49 +116,17 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Process A2 — Feed Handler (SOL) ──────────────────────────────────────────
-  # Reuses the same market_data.py image; TRADE_SYMBOL override switches the pair.
-  feed-handler-sol:
-    build:
-      context: .
-      dockerfile: services/feed-handler/Dockerfile
-    container_name: tradingsystem_feed_handler_sol
-    env_file: .env
-    environment:
-      REDIS_HOST: redis
-      TRADE_SYMBOL: SOL/USD
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
   # ── Process H — SOL EMA Momentum Strategy ─────────────────────────────────────
   sol-strategy-engine:
     build:
       context: .
-      dockerfile: services/sol-strategy/Dockerfile
+      dockerfile: services/strategy-engine/Dockerfile
     container_name: tradingsystem_sol_strategy
     env_file: .env
     environment:
       REDIS_HOST: redis
       TRADE_SYMBOL: SOL/USD
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # ── Process A3 — Feed Handler (XRP) ──────────────────────────────────────────
-  # Reuses the same market_data.py image; TRADE_SYMBOL override switches the pair.
-  # Publishes {"symbol": "XRP/USD", ...} to the shared market_data channel.
-  feed-handler-xrp:
-    build:
-      context: .
-      dockerfile: services/feed-handler/Dockerfile
-    container_name: tradingsystem_feed_handler_xrp
-    env_file: .env
-    environment:
-      REDIS_HOST: redis
-      TRADE_SYMBOL: XRP/USD
+      STRATEGY_FILE: sol_strategy_engine.py
     depends_on:
       redis:
         condition: service_healthy
@@ -162,27 +136,13 @@ services:
   xrp-strategy-engine:
     build:
       context: .
-      dockerfile: services/xrp-strategy/Dockerfile
+      dockerfile: services/strategy-engine/Dockerfile
     container_name: tradingsystem_xrp_strategy
     env_file: .env
     environment:
       REDIS_HOST: redis
       TRADE_SYMBOL: XRP/USD
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # ── Process A4 — Feed Handler (ETH) ──────────────────────────────────────────
-  feed-handler-eth:
-    build:
-      context: .
-      dockerfile: services/feed-handler/Dockerfile
-    container_name: tradingsystem_feed_handler_eth
-    env_file: .env
-    environment:
-      REDIS_HOST: redis
-      TRADE_SYMBOL: ETH/USD
+      STRATEGY_FILE: xrp_strategy_engine.py
     depends_on:
       redis:
         condition: service_healthy
@@ -199,21 +159,7 @@ services:
     environment:
       REDIS_HOST: redis
       TRADE_SYMBOL: ETH/USD
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # ── Process A5 — Feed Handler (FET) ──────────────────────────────────────────
-  feed-handler-fet:
-    build:
-      context: .
-      dockerfile: services/feed-handler/Dockerfile
-    container_name: tradingsystem_feed_handler_fet
-    env_file: .env
-    environment:
-      REDIS_HOST: redis
-      TRADE_SYMBOL: FET/USD
+      STRATEGY_FILE: btc_eth_strategy_engine.py
     depends_on:
       redis:
         condition: service_healthy
@@ -223,12 +169,13 @@ services:
   fet-strategy-engine:
     build:
       context: .
-      dockerfile: services/fet-strategy/Dockerfile
+      dockerfile: services/strategy-engine/Dockerfile
     container_name: tradingsystem_fet_strategy
     env_file: .env
     environment:
       REDIS_HOST: redis
       TRADE_SYMBOL: FET/USD
+      STRATEGY_FILE: fet_strategy_engine.py
     depends_on:
       redis:
         condition: service_healthy

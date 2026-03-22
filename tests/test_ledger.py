@@ -53,6 +53,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(row["Pair"], "BTC/USD")
         self.assertEqual(row["Price"], "8100.50000000")
         self.assertEqual(row["Quantity"], "1.25000000")
+        self.assertEqual(row["Requested_Qty"], "0.00000000")
+        self.assertEqual(row["Effective_Qty"], "0.00000000")
         self.assertEqual(row["Strategy_Signal"], "BB_Lower_Cross")
         self.assertEqual(row["API_Status"], "200 SUCCESS")
 
@@ -88,6 +90,8 @@ class LedgerTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["Pair"], "BTC/USD")
+        self.assertEqual(rows[0]["Requested_Qty"], "1.00000000")
+        self.assertEqual(rows[0]["Effective_Qty"], "1.00000000")
         self.assertEqual(rows[0]["Strategy_Signal"], "Mean_Reversion_TP")
 
 

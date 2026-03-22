@@ -47,40 +47,43 @@ EXECUTION_CONFIRMATIONS_CHANNEL = "execution_confirmations"
 DEFAULT_SYMBOL     = os.getenv("TRADE_SYMBOL", "BTC/USD")
 DEFAULT_ORDER_TYPE = "MARKET"
 
+# Symbol prefix: allows per-symbol env var overrides.
+# ETH instance reads ETH_WINDOW_PERIOD first, falling back to WINDOW_PERIOD.
+# BTC instance reads BTC_WINDOW_PERIOD first, falling back to WINDOW_PERIOD.
+_SYM = DEFAULT_SYMBOL.split("/")[0].upper()   # "BTC" or "ETH"
+
+def _cfg(key: str, default: str) -> str:
+    return os.getenv(f"{_SYM}_{key}", os.getenv(key, default))
+
 # Bollinger Band window.
-# At 5-second polling: 120 periods ≈ 10 minutes (more statistically robust than original 20 × 5s = 100s).
-WINDOW_PERIOD = int(os.getenv("WINDOW_PERIOD", "120"))
+WINDOW_PERIOD = int(_cfg("WINDOW_PERIOD", "120"))
 
 # Trend filter: only allow BUY when price > this SMA.
-# At 5s polling: 480 periods ≈ 40 minutes — provides meaningful separation from Bollinger window.
-TREND_FILTER_PERIOD = int(os.getenv("TREND_FILTER_PERIOD", "480"))
+TREND_FILTER_PERIOD = int(_cfg("TREND_FILTER_PERIOD", "480"))
 
-# ATR stop-loss (replaces fixed STOP_LOSS_MULTIPLIER = 0.97).
-# stop_price = entry - ATR_STOPLOSS_K × ATR(14). Adapts to current volatility regime.
-ATR_PERIOD      = int(os.getenv("ATR_PERIOD",      "14"))
-ATR_STOPLOSS_K  = float(os.getenv("ATR_STOPLOSS_K", "1.5"))
-# Fallback fixed stop used before ATR seeds (first ATR_PERIOD ticks).
-FALLBACK_STOP_LOSS = float(os.getenv("FALLBACK_STOP_LOSS_MULTIPLIER", "0.97"))
+# ATR stop-loss.
+ATR_PERIOD      = int(_cfg("ATR_PERIOD",      "14"))
+ATR_STOPLOSS_K  = float(_cfg("ATR_STOPLOSS_K", "1.5"))
+FALLBACK_STOP_LOSS = float(_cfg("FALLBACK_STOP_LOSS_MULTIPLIER", "0.97"))
 
 # Partial exits: first 50% at SMA, second 50% at upper Bollinger Band.
-PARTIAL_EXITS_ENABLED = os.getenv("PARTIAL_EXITS_ENABLED", "true").lower() == "true"
+PARTIAL_EXITS_ENABLED = _cfg("PARTIAL_EXITS_ENABLED", "true").lower() == "true"
 
 # Portfolio and base sizing.
 PORTFOLIO_USD    = float(os.getenv("PORTFOLIO_USD",    "1000000"))
-RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE",   "0.02"))
+RISK_PER_TRADE   = float(_cfg("RISK_PER_TRADE",        "0.02"))
 TARGET_ORDER_USD = PORTFOLIO_USD * RISK_PER_TRADE
 
 # Dynamic sizing scalars.
-# vol_scalar  = 1 / (1 + VOLATILITY_SENSITIVITY × norm_vol)  where norm_vol = std/sma
-# At norm_vol=0.05 and sensitivity=20: scalar = 0.5 (half size in 5% relative vol).
-VOLATILITY_SENSITIVITY = float(os.getenv("VOLATILITY_SENSITIVITY", "20.0"))
-MIN_POSITION_SCALAR    = float(os.getenv("MIN_POSITION_SCALAR",    "0.4"))
+VOLATILITY_SENSITIVITY = float(_cfg("VOLATILITY_SENSITIVITY", "20.0"))
+MIN_POSITION_SCALAR    = float(_cfg("MIN_POSITION_SCALAR",    "0.4"))
 
-POLL_TIMEOUT_SEC   = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
-RETRY_DELAY_SEC    = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
-TRADING_FEE_RATE   = float(os.getenv("TRADING_FEE_RATE",          "0.001"))
-MIN_SELL_MULTIPLIER = float(os.getenv("MIN_SELL_MULTIPLIER",      "1.0025"))
-COOLDOWN_SECONDS   = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",       "3600"))
+POLL_TIMEOUT_SEC         = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC",   "1.0"))
+RETRY_DELAY_SEC          = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",      "5"))
+TRADING_FEE_RATE         = float(os.getenv("TRADING_FEE_RATE",            "0.001"))
+MIN_SELL_MULTIPLIER      = float(_cfg("MIN_SELL_MULTIPLIER",               "1.0025"))
+COOLDOWN_SECONDS         = int(_cfg("STOP_LOSS_COOLDOWN_SEC",              "3600"))
+CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC",    "60"))
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -132,12 +135,16 @@ half_position_sold: bool       = False   # True after first partial exit, False 
 
 # Execution handshake state
 pending_action: str | None     = None
+pending_action_since: float    = 0.0
 pending_sell_quantity: str     = "0.0000"
 cooldown_until: float          = 0.0
 
 # Startup guards
 boot_liquidation_done: bool    = False
 boot_liquidation_pending: bool = False
+
+# Redis key for persisted position state (survives container restarts).
+STATE_KEY = f"strategy_state:{DEFAULT_SYMBOL}"
 
 
 # ── Shutdown Handler ───────────────────────────────────────────────────────────
@@ -310,8 +317,15 @@ async def evaluate_market_tick(
 
     # ── 7. Suppress while pending ────────────────────────────────────────────
     if pending_action is not None:
-        log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
-        return
+        if time.time() - pending_action_since > CONFIRMATION_TIMEOUT_SEC:
+            log.warning(
+                "Pending %s confirmation timed out after %.0fs — resetting.",
+                pending_action, CONFIRMATION_TIMEOUT_SEC,
+            )
+            pending_action = None
+        else:
+            log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
+            return
 
     if boot_liquidation_pending:
         log.info("Signal suppressed: awaiting startup liquidation.")
@@ -334,8 +348,9 @@ async def evaluate_market_tick(
             )
             return
 
-        pending_action = "BUY"
-        entry_price    = price
+        pending_action       = "BUY"
+        pending_action_since = time.time()
+        entry_price          = price
 
         # ATR-based stop-loss; fall back to fixed % before ATR seeds.
         if current_atr and current_atr > 0:
@@ -370,6 +385,7 @@ async def evaluate_market_tick(
     if price <= stop_loss_price:
         sell_qty              = open_position_quantity
         pending_action        = "SELL"
+        pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
         cooldown_until        = now_ts + COOLDOWN_SECONDS
         await publish_signal(
@@ -398,6 +414,7 @@ async def evaluate_market_tick(
 
             if half_qty > 0:
                 pending_action        = "SELL"
+                pending_action_since  = time.time()
                 pending_sell_quantity = f"{half_qty:.4f}"
                 await publish_signal(
                     redis_client,
@@ -419,6 +436,7 @@ async def evaluate_market_tick(
         if half_position_sold and price >= upper_band:
             sell_qty              = open_position_quantity
             pending_action        = "SELL"
+            pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
             await publish_signal(
                 redis_client,
@@ -436,6 +454,7 @@ async def evaluate_market_tick(
         if price >= sma and price >= minimum_sell_price:
             sell_qty              = open_position_quantity
             pending_action        = "SELL"
+            pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
             await publish_signal(
                 redis_client,
@@ -450,6 +469,46 @@ async def evaluate_market_tick(
 
         if price >= sma:
             log.info("Holding position: SMA reached but 0.25%% fee spread not met.")
+
+
+# ── State Persistence ──────────────────────────────────────────────────────────
+async def _save_state(redis_client: aioredis.Redis) -> None:
+    """Persist position state to Redis so restarts don't trigger liquidation."""
+    try:
+        await redis_client.hset(STATE_KEY, mapping={
+            "in_position":            str(in_position),
+            "open_position_quantity": open_position_quantity,
+            "entry_price":            str(entry_price),
+            "stop_loss_price":        str(stop_loss_price),
+            "half_position_sold":     str(half_position_sold),
+            "cooldown_until":         str(cooldown_until),
+        })
+    except aioredis.RedisError as exc:
+        log.warning("Failed to persist state: %s", exc)
+
+
+async def _load_state(redis_client: aioredis.Redis) -> bool:
+    """Load persisted state. Returns True if state was found and loaded."""
+    global in_position, open_position_quantity, entry_price
+    global stop_loss_price, half_position_sold, cooldown_until
+    try:
+        state = await redis_client.hgetall(STATE_KEY)
+    except aioredis.RedisError as exc:
+        log.warning("Failed to load persisted state: %s", exc)
+        return False
+    if not state or state.get("in_position") is None:
+        return False
+    in_position            = state.get("in_position", "False") == "True"
+    open_position_quantity = state.get("open_position_quantity", "0.0000")
+    entry_price            = float(state.get("entry_price",     "0.0"))
+    stop_loss_price        = float(state.get("stop_loss_price", "0.0"))
+    half_position_sold     = state.get("half_position_sold", "False") == "True"
+    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    log.info(
+        "Resumed persisted state: in_position=%s qty=%s entry=%.4f stop=%.4f half_sold=%s",
+        in_position, open_position_quantity, entry_price, stop_loss_price, half_position_sold,
+    )
+    return True
 
 
 # ── Execution Confirmation Handler ─────────────────────────────────────────────
@@ -481,7 +540,7 @@ def handle_order_result_update(raw_payload: str) -> None:
     return
 
 
-def handle_execution_confirmation(raw_payload: str) -> None:
+async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis.Redis) -> None:
     global in_position, open_position_quantity, pending_action, entry_price
     global stop_loss_price, pending_sell_quantity, boot_liquidation_pending
     global half_position_sold
@@ -520,6 +579,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         entry_price              = 0.0
         stop_loss_price          = 0.0
         half_position_sold       = False
+        await _save_state(redis_client)
         if result == "SUCCESS":
             log.info("Startup liquidation completed.")
         else:
@@ -559,7 +619,8 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         open_position_quantity = f"{net_qty:.4f}"
         pending_sell_quantity  = "0.0000"
         pending_action         = None
-        half_position_sold     = False   # reset for new position
+        half_position_sold     = False
+        await _save_state(redis_client)
         log.info(
             "BUY confirmed: executed=%.8f fee_rate=%.4f net_qty=%s entry=%.6f stop=%.6f",
             executed_qty, TRADING_FEE_RATE, open_position_quantity,
@@ -579,15 +640,14 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         pending_sell_quantity  = "0.0000"
 
         if remaining <= 0.0:
-            # Position fully closed.
             entry_price        = 0.0
             stop_loss_price    = 0.0
             half_position_sold = False
         else:
-            # Partial sell confirmed — still holding the second half.
             half_position_sold = True
 
         pending_action = None
+        await _save_state(redis_client)
         log.info(
             "SELL confirmed: executed=%.8f remaining_qty=%s half_sold=%s",
             executed_qty, open_position_quantity, half_position_sold,
@@ -657,7 +717,7 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
                 continue
 
             if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
-                handle_execution_confirmation(payload)
+                await handle_execution_confirmation(payload, redis_client)
                 continue
 
             if channel != MARKET_DATA_CHANNEL:
@@ -744,10 +804,13 @@ async def run() -> None:
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
             if not boot_liquidation_done:
-                # Wait for execution manager to subscribe to trade_signals.
                 await asyncio.sleep(8)
-                await initialize_clean_slate(redis_client)
-                boot_liquidation_done = True
+                if await _load_state(redis_client):
+                    log.info("Resumed from persisted state — skipping startup liquidation.")
+                    boot_liquidation_done = True
+                else:
+                    await initialize_clean_slate(redis_client)
+                    boot_liquidation_done = True
 
             await consume_stream(redis_client)
 

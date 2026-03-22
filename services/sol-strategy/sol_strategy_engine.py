@@ -86,6 +86,7 @@ MIN_SELL_MULTIPLIER = float(os.getenv("SOL_MIN_SELL_MULTIPLIER", "1.003"))
 POLL_TIMEOUT_SEC  = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC", "1.0"))
 RETRY_DELAY_SEC   = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",    "5"))
 COOLDOWN_SECONDS  = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",       "3600"))
+CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC", "60"))
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -122,12 +123,15 @@ atr_at_entry: float         = 0.0   # ATR snapshot at entry — stop-loss anchor
 
 # Execution handshake
 pending_action: str | None  = None
+pending_action_since: float = 0.0
 pending_sell_quantity: str  = "0.0000"
 cooldown_until: float       = 0.0
 
 # Startup guards
 boot_liquidation_done: bool    = False
 boot_liquidation_pending: bool = False
+
+STATE_KEY = f"strategy_state:{TRADE_SYMBOL}"
 
 
 # ── Shutdown Handler ───────────────────────────────────────────────────────────
@@ -186,6 +190,41 @@ def _target_quantity(price: float) -> str:
     return str(qty)
 
 
+# ── State Persistence ──────────────────────────────────────────────────────────
+async def _save_state(redis_client: aioredis.Redis) -> None:
+    try:
+        await redis_client.hset(STATE_KEY, mapping={
+            "in_position":            str(in_position),
+            "open_position_quantity": open_position_quantity,
+            "entry_price":            str(entry_price),
+            "atr_at_entry":           str(atr_at_entry),
+            "cooldown_until":         str(cooldown_until),
+        })
+    except aioredis.RedisError as exc:
+        log.warning("Failed to persist state: %s", exc)
+
+
+async def _load_state(redis_client: aioredis.Redis) -> bool:
+    global in_position, open_position_quantity, entry_price, atr_at_entry, cooldown_until
+    try:
+        state = await redis_client.hgetall(STATE_KEY)
+    except aioredis.RedisError as exc:
+        log.warning("Failed to load persisted state: %s", exc)
+        return False
+    if not state or state.get("in_position") is None:
+        return False
+    in_position            = state.get("in_position", "False") == "True"
+    open_position_quantity = state.get("open_position_quantity", "0")
+    entry_price            = float(state.get("entry_price",    "0.0"))
+    atr_at_entry           = float(state.get("atr_at_entry",  "0.0"))
+    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    log.info(
+        "Resumed persisted state: in_position=%s qty=%s entry=%.4f atr_entry=%.6f",
+        in_position, open_position_quantity, entry_price, atr_at_entry,
+    )
+    return True
+
+
 # ── Signal Publishing ──────────────────────────────────────────────────────────
 async def _publish_signal(
     redis_client: aioredis.Redis,
@@ -225,7 +264,7 @@ async def evaluate_market_tick(
     redis_client: aioredis.Redis,
 ) -> None:
     global fast_ema, slow_ema, prev_fast_ema, prev_slow_ema, tick_count
-    global pending_action, in_position, open_position_quantity
+    global pending_action, pending_action_since, in_position, open_position_quantity
     global entry_price, atr_at_entry, cooldown_until, pending_sell_quantity
     global boot_liquidation_pending
 
@@ -281,8 +320,15 @@ async def evaluate_market_tick(
 
     # ── Suppress while pending ────────────────────────────────────────────────
     if pending_action is not None:
-        log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
-        return
+        if time.time() - pending_action_since > CONFIRMATION_TIMEOUT_SEC:
+            log.warning(
+                "Pending %s confirmation timed out after %.0fs — resetting.",
+                pending_action, CONFIRMATION_TIMEOUT_SEC,
+            )
+            pending_action = None
+        else:
+            log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
+            return
 
     if boot_liquidation_pending:
         log.info("Signal suppressed: awaiting startup liquidation.")
@@ -295,9 +341,10 @@ async def evaluate_market_tick(
         and golden_cross
         and global_sentiment_score > SENTIMENT_ENTRY_GATE
     ):
-        quantity       = _target_quantity(price)
-        pending_action = "BUY"
-        entry_price    = price
+        quantity             = _target_quantity(price)
+        pending_action       = "BUY"
+        pending_action_since = time.time()
+        entry_price          = price
 
         # ATR stop-loss with fixed fallback.
         if current_atr and current_atr > 0:
@@ -339,6 +386,7 @@ async def evaluate_market_tick(
     if price <= stop_loss_price:
         sell_qty              = open_position_quantity
         pending_action        = "SELL"
+        pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
         cooldown_until        = now_ts + COOLDOWN_SECONDS
         await _publish_signal(
@@ -368,6 +416,7 @@ async def evaluate_market_tick(
         else:
             sell_qty              = open_position_quantity
             pending_action        = "SELL"
+            pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
             await _publish_signal(
                 redis_client,
@@ -386,7 +435,7 @@ async def evaluate_market_tick(
 
 
 # ── Execution Confirmation Handler ─────────────────────────────────────────────
-def handle_execution_confirmation(raw_payload: str) -> None:
+async def handle_execution_confirmation(raw_payload: str, redis_client: aioredis.Redis) -> None:
     global in_position, open_position_quantity, pending_action, entry_price
     global atr_at_entry, pending_sell_quantity, boot_liquidation_pending
 
@@ -425,6 +474,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         open_position_quantity   = "0.0000"
         entry_price              = 0.0
         atr_at_entry             = 0.0
+        await _save_state(redis_client)
         if result == "SUCCESS":
             log.info("Startup liquidation completed for %s.", TRADE_SYMBOL)
         else:
@@ -466,6 +516,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
         open_position_quantity = str(net_qty)
         pending_sell_quantity  = "0"
         pending_action         = None
+        await _save_state(redis_client)
         log.info(
             "BUY confirmed: executed=%.8f fee_rate=%.4f net_qty=%s entry=%.6f",
             executed_qty, TRADING_FEE_RATE, open_position_quantity, entry_price,
@@ -485,6 +536,7 @@ def handle_execution_confirmation(raw_payload: str) -> None:
             entry_price  = 0.0
             atr_at_entry = 0.0
         pending_action = None
+        await _save_state(redis_client)
         log.info(
             "SELL confirmed: executed=%.8f remaining_qty=%s",
             executed_qty, open_position_quantity,
@@ -549,7 +601,7 @@ async def consume_stream(redis_client: aioredis.Redis) -> None:
                 continue
 
             if channel == EXECUTION_CONFIRMATIONS_CHANNEL:
-                handle_execution_confirmation(payload)
+                await handle_execution_confirmation(payload, redis_client)
                 continue
 
             if channel == MARKET_DATA_CHANNEL:
@@ -634,12 +686,13 @@ async def run() -> None:
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
             if not boot_liquidation_done:
-                # Wait for execution manager to subscribe to trade_signals.
-                # Both containers start simultaneously — without this delay the
-                # liquidation signal is published before anyone is listening.
                 await asyncio.sleep(8)
-                await initialize_clean_slate(redis_client)
-                boot_liquidation_done = True
+                if await _load_state(redis_client):
+                    log.info("Resumed from persisted state — skipping startup liquidation.")
+                    boot_liquidation_done = True
+                else:
+                    await initialize_clean_slate(redis_client)
+                    boot_liquidation_done = True
 
             await consume_stream(redis_client)
 

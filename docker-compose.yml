@@ -173,31 +173,62 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Process A4 — Feed Handler (PAXG) ─────────────────────────────────────────
-  feed-handler-paxg:
+  # ── Process A4 — Feed Handler (ETH) ──────────────────────────────────────────
+  feed-handler-eth:
     build:
       context: .
       dockerfile: services/feed-handler/Dockerfile
-    container_name: tradingsystem_feed_handler_paxg
+    container_name: tradingsystem_feed_handler_eth
     env_file: .env
     environment:
       REDIS_HOST: redis
-      TRADE_SYMBOL: PAXG/USD
+      TRADE_SYMBOL: ETH/USD
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Process I — PAXG Bollinger Band Mean Reversion Strategy ──────────────────
-  paxg-strategy-engine:
+  # ── Process I — ETH Bollinger Band Mean Reversion Strategy ───────────────────
+  # Reuses strategy-engine (BTC) code; ETH_ prefixed env vars override BTC params.
+  eth-strategy-engine:
     build:
       context: .
-      dockerfile: services/paxg-strategy/Dockerfile
-    container_name: tradingsystem_paxg_strategy
+      dockerfile: services/strategy-engine/Dockerfile
+    container_name: tradingsystem_eth_strategy
     env_file: .env
     environment:
       REDIS_HOST: redis
-      TRADE_SYMBOL: PAXG/USD
+      TRADE_SYMBOL: ETH/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process A5 — Feed Handler (FET) ──────────────────────────────────────────
+  feed-handler-fet:
+    build:
+      context: .
+      dockerfile: services/feed-handler/Dockerfile
+    container_name: tradingsystem_feed_handler_fet
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: FET/USD
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Process J — FET ATR Breakout Strategy ────────────────────────────────────
+  fet-strategy-engine:
+    build:
+      context: .
+      dockerfile: services/fet-strategy/Dockerfile
+    container_name: tradingsystem_fet_strategy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: FET/USD
     depends_on:
       redis:
         condition: service_healthy

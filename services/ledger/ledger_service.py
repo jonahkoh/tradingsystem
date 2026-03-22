@@ -9,6 +9,8 @@ CSV headers (exact):
   Pair
   Price
   Quantity
+    Requested_Qty
+    Effective_Qty
   Strategy_Signal
   API_Status
 """
@@ -44,6 +46,8 @@ CSV_HEADERS = [
     "Pair",
     "Price",
     "Quantity",
+    "Requested_Qty",
+    "Effective_Qty",
     "Strategy_Signal",
     "API_Status",
 ]
@@ -123,12 +127,17 @@ def build_csv_row(order_result: dict[str, Any]) -> dict[str, str]:
     else:
         api_status = f"{status_code} {result or 'FAILED'}"
 
+    requested_qty = float(order_result.get("requested_qty", order_result.get("qty", 0.0)))
+    effective_qty = float(order_result.get("effective_qty", order_result.get("qty", 0.0)))
+
     return {
         "Timestamp": _format_timestamp(order_result.get("timestamp")),
         "Action": action,
         "Pair": pair,
         "Price": f"{_extract_price(order_result):.8f}",
         "Quantity": f"{_extract_quantity(order_result):.8f}",
+        "Requested_Qty": f"{requested_qty:.8f}",
+        "Effective_Qty": f"{effective_qty:.8f}",
         "Strategy_Signal": strategy_signal,
         "API_Status": api_status,
     }

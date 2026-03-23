@@ -548,19 +548,22 @@ async def evaluate_market_tick(
             prev_price = price
             return
 
-        # 2. Exit — threshold depends on the regime under which we entered
-        if entry_regime == "RANGING":
+        # 2. Exit — threshold depends on the regime under which we entered.
+        # If entry_regime is empty (e.g. position synced from exchange history rather than
+        # initiated by this strategy), fall back to current_regime so the correct exit rule applies.
+        effective_entry_regime = entry_regime if entry_regime else current_regime
+        if effective_entry_regime == "RANGING":
             take_profit = max(sma20, average_cost * (1.0 + BB_PROFIT_MARGIN))
             tp_triggered = price >= take_profit
             tp_reason    = f"BB_MeanReversion_exit_sma={sma20:.4f}_avg={average_cost:.4f}"
-        elif entry_regime == "TRENDING_UP":
+        elif effective_entry_regime == "TRENDING_UP":
             # Death cross: EMA7 crosses below EMA99 — trend exhaustion exit
             tp_triggered = _death_cross() and price > average_cost * (1.0 + TRADING_FEE_RATE * 2)
             tp_reason    = f"EMA_DeathCross_fast={ema_fast:.4f}_slow={ema_slow:.4f}_avg={average_cost:.4f}"
         else:
             take_profit  = average_cost * (1.0 + PROFIT_MARGIN)
             tp_triggered = price >= take_profit
-            tp_reason    = f"DCA_TakeProfit_{int(PROFIT_MARGIN * 100)}pct_avg={average_cost:.4f}_tr={tranche_count}"
+            tp_reason    = f"DCA_TakeProfit_{int(PROFIT_MARGIN * 100)}pct_avg={average_cost:.4f}_tr={tranche_count}_regime={effective_entry_regime}"
 
         if tp_triggered:
             sell_qty              = open_position_quantity
@@ -577,14 +580,14 @@ async def evaluate_market_tick(
 
         # 3. DCA additional tranches (only relevant for DCA entry modes)
         if (
-            entry_regime in ("TRENDING_DOWN", "UNCLEAR", "")
+            effective_entry_regime in ("TRENDING_DOWN", "UNCLEAR", "")
             and tranche_count < MAX_TRANCHES
             and last_buy_price > 0
             and price <= last_buy_price * (1.0 - TRANCHE_DIP_PCT)
             and now_ts > cooldown_until
             and global_sentiment_score > SENTIMENT_GATE
         ):
-            unclear_adj = 0.5 if entry_regime == "UNCLEAR" else 1.0
+            unclear_adj = 0.5 if effective_entry_regime == "UNCLEAR" else 1.0
             alloc       = TARGET_ORDER_USD / MAX_TRANCHES
             raw_qty     = int(_sized_quantity(price, alloc) or "0")
             quantity    = str(int(raw_qty * unclear_adj))

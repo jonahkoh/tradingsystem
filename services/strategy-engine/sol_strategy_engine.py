@@ -135,7 +135,7 @@ TARGET_ORDER_USD = PORTFOLIO_USD * SOL_ALLOCATION
 TRADING_FEE_RATE         = float(os.getenv("TRADING_FEE_RATE",            "0.001"))
 POLL_TIMEOUT_SEC         = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC",   "1.0"))
 RETRY_DELAY_SEC          = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",      "5"))
-COOLDOWN_SECONDS         = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",        "3600"))
+COOLDOWN_SECONDS         = int(os.getenv("SOL_STOP_LOSS_COOLDOWN_SEC", os.getenv("STOP_LOSS_COOLDOWN_SEC", "3600")))
 CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC",    "60"))
 
 

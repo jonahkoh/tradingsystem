@@ -89,9 +89,15 @@ def cancel_all_orders(pair: str) -> None:
     client = _get_client()
     binance_sym = _to_binance_symbol(pair)
     try:
-        client.cancel_all_open_orders(symbol=binance_sym)
+        open_orders = client.get_open_orders(symbol=binance_sym)
+        for order in open_orders:
+            try:
+                client.cancel_order(symbol=binance_sym, orderId=order["orderId"])
+            except BinanceAPIException as exc:
+                if exc.code != -2011:
+                    raise
     except BinanceAPIException as exc:
-        if exc.code != -2011:  # "Unknown order" is fine
+        if exc.code != -2011:
             raise
 
 

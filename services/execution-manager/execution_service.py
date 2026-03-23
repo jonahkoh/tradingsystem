@@ -501,6 +501,14 @@ def _query_orders(
 
 
 def _query_all_orders(http_client: httpx.Client, *, pair: str | None = None) -> list[dict[str, Any]]:
+    if EXCHANGE == "binance":
+        if pair:
+            return _bn.query_orders(pair, limit=QUERY_ORDER_LIMIT)
+        out: list[dict[str, Any]] = []
+        for p in INVENTORY_SYNC_PAIRS:
+            out.extend(_bn.query_orders(p, limit=QUERY_ORDER_LIMIT))
+        return out
+
     out: list[dict[str, Any]] = []
     offset: int | None = None
     page_size = max(QUERY_ORDER_LIMIT, 1)
@@ -1059,14 +1067,16 @@ def run() -> None:
                 r.ping()
                 log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
-                if SYNC_STATE_ON_STARTUP or SYNC_HISTORY_TO_LEDGER:
+                if EXCHANGE == "binance":
+                    log.info("Binance mode: skipping startup sync (strategies manage their own state).")
+                elif SYNC_STATE_ON_STARTUP or SYNC_HISTORY_TO_LEDGER:
                     time.sleep(max(STARTUP_SYNC_DELAY_SEC, 0.0))
 
-                if SYNC_HISTORY_TO_LEDGER:
+                if EXCHANGE != "binance" and SYNC_HISTORY_TO_LEDGER:
                     _clear_ledger_csv_file(r)
                     _sync_order_history_to_ledger(http_client, r)
 
-                if SYNC_STATE_ON_STARTUP:
+                if EXCHANGE != "binance" and SYNC_STATE_ON_STARTUP:
                     _sync_strategy_state_from_roostoo(http_client, r)
 
                 pubsub = r.pubsub(ignore_subscribe_messages=True)

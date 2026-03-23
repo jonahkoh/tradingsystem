@@ -183,6 +183,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── SOL MA(7/99) Crossover Test Strategy (Binance testnet validation) ────────
+  sol-ma-test:
+    build:
+      context: .
+      dockerfile: services/strategy-engine/Dockerfile
+    container_name: tradingsystem_sol_ma_test
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      TRADE_SYMBOL: SOL/USD
+      STRATEGY_FILE: sol_ma_test_strategy.py
+      SOL_TEST_QTY: "1"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:
 

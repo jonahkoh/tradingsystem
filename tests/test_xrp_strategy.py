@@ -54,6 +54,13 @@ class XrpStrategyTests(unittest.TestCase):
         # Startup guards
         xrp.boot_liquidation_pending = False
 
+        # Regime detection state
+        xrp.regime_prices_short.clear()
+        xrp.regime_prices_long.clear()
+        xrp.current_regime         = "TRENDING_UP"   # default: permit entries in most tests
+        xrp.regime_candidate       = "TRENDING_UP"
+        xrp.regime_candidate_ticks = 0
+
         # Pin env-driven params to defaults so .env overrides don't affect tests.
         xrp.TAKE_PROFIT_MULT = 1.08
 
@@ -143,6 +150,37 @@ class XrpStrategyTests(unittest.TestCase):
         xrp.xrp_sentiment_score  = xrp.SENTIMENT_FEAR_GATE   # exactly at gate (not above)
 
         asyncio.run(xrp.evaluate_market_tick(1.20, "XRP/USD", 2, redis_stub))
+
+        self.assertEqual(len(redis_stub.messages), 0)
+        self.assertIsNone(xrp.pending_action)
+
+    def test_buy_suppressed_in_ranging_regime(self):
+        """ATR breakout must be suppressed when regime is RANGING (not TRENDING_UP)."""
+        redis_stub = _RedisStub()
+
+        xrp.atr_value            = 0.05
+        xrp.atr_initialized      = True
+        xrp.last_price           = 1.00
+        xrp.xrp_sentiment_score  = 0.3
+        xrp.current_regime       = "RANGING"   # override to ranging
+
+        # Same spike that would trigger a BUY in TRENDING_UP.
+        asyncio.run(xrp.evaluate_market_tick(1.20, "XRP/USD", 3, redis_stub))
+
+        self.assertEqual(len(redis_stub.messages), 0)
+        self.assertIsNone(xrp.pending_action)
+
+    def test_buy_suppressed_in_trending_down_regime(self):
+        """ATR breakout must be suppressed when regime is TRENDING_DOWN."""
+        redis_stub = _RedisStub()
+
+        xrp.atr_value            = 0.05
+        xrp.atr_initialized      = True
+        xrp.last_price           = 1.00
+        xrp.xrp_sentiment_score  = 0.3
+        xrp.current_regime       = "TRENDING_DOWN"
+
+        asyncio.run(xrp.evaluate_market_tick(1.20, "XRP/USD", 3, redis_stub))
 
         self.assertEqual(len(redis_stub.messages), 0)
         self.assertIsNone(xrp.pending_action)

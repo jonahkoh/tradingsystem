@@ -6,5 +6,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY services/feed-handler/market_data.py ./market_data.py
+COPY services/feed-handler/binance_adapter.py ./binance_adapter.py
 
 CMD ["python", "market_data.py"]

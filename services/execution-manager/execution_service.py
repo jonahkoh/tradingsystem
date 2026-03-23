@@ -1,7 +1,11 @@
 """
-Process C - Execution Service (Roostoo)
-=======================================
-Listens to Redis `trade_signals` and executes signed POST orders on Roostoo.
+Process C - Execution Service
+==============================
+Listens to Redis `trade_signals` and executes signed orders.
+
+Supports two exchanges (selected by EXCHANGE env var):
+  - roostoo  (default): Roostoo mock API
+  - binance:            Binance Spot Testnet
 
 Inbound signal example:
   {"action": "BUY", "symbol": "BTC/USD", "type": "MARKET", "quantity": "1.0"}
@@ -38,9 +42,13 @@ load_dotenv()
 
 
 # Configuration
+EXCHANGE = os.getenv("EXCHANGE", "roostoo").strip().lower()
 ROOSTOO_BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com").strip().rstrip("/")
 API_KEY = os.getenv("API_KEY", "").strip()
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+
+if EXCHANGE == "binance":
+    import binance_adapter as _bn
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -332,6 +340,9 @@ def _extract_locked_balance(response_json: Any, asset: str) -> float:
 
 
 def _get_balance_snapshot(http_client: httpx.Client, pair: str) -> tuple[float, float]:
+    if EXCHANGE == "binance":
+        return _bn.get_balance(pair)
+
     base_asset = _base_asset_from_pair(pair)
     timestamp = _current_ms()
     params = {"timestamp": timestamp}
@@ -371,6 +382,10 @@ def _base_asset_from_pair(pair: str) -> str:
 
 
 def _get_available_base_balance(http_client: httpx.Client, pair: str) -> float:
+    if EXCHANGE == "binance":
+        free, _locked = _bn.get_balance(pair)
+        return free
+
     base_asset = _base_asset_from_pair(pair)
     timestamp = _current_ms()
     params = {"timestamp": timestamp}
@@ -396,6 +411,10 @@ def _get_available_base_balance(http_client: httpx.Client, pair: str) -> float:
 
 
 def _cancel_all_open_orders(http_client: httpx.Client, pair: str) -> None:
+    if EXCHANGE == "binance":
+        _bn.cancel_all_orders(pair)
+        return
+
     ts = _current_ms()
     params = {"pair": pair, "timestamp": ts}
     payload = _sorted_params_string(params)
@@ -432,6 +451,9 @@ def _query_orders(
     limit: int = QUERY_ORDER_LIMIT,
     pending_only: bool | None = None,
 ) -> list[dict[str, Any]]:
+    if EXCHANGE == "binance" and pair:
+        return _bn.query_orders(pair, limit=limit)
+
     params: dict[str, Any] = {
         "timestamp": _current_ms(),
         "limit": str(max(limit, 1)),
@@ -511,6 +533,9 @@ def _safe_int(value: Any) -> int:
 
 
 def _get_mid_price(http_client: httpx.Client, pair: str) -> float:
+    if EXCHANGE == "binance":
+        return _bn.get_mid_price(pair)
+
     params = {
         "pair": pair.strip().upper(),
         "timestamp": str(_current_ms()),
@@ -542,6 +567,9 @@ def _get_mid_price(http_client: httpx.Client, pair: str) -> float:
 
 
 def _pair_step_decimals(pair: str) -> int:
+    if EXCHANGE == "binance":
+        return _bn.get_pair_precision(pair)
+
     pair_upper = pair.upper()
     if pair_upper in {"SOL/USD", "XRP/USD"}:
         return 0
@@ -828,6 +856,16 @@ def execute_trade_signal(
 
     quantity = _format_qty_for_pair(pair, effective_qty)
 
+    throttle.wait()
+    _cancel_all_open_orders(http_client, pair)
+
+    if EXCHANGE == "binance":
+        result = _bn.place_order(pair, side, quantity, order_type)
+        result["requested_qty"] = requested_qty
+        result["effective_qty"] = effective_qty
+        redis_client.publish(RESULTS_CHANNEL, json.dumps(result))
+        return result
+
     params = {
         "pair": pair,
         "quantity": quantity,
@@ -847,10 +885,6 @@ def execute_trade_signal(
             payload,
             signature[:12],
         )
-
-    throttle.wait()
-
-    _cancel_all_open_orders(http_client, pair)
 
     url = f"{ROOSTOO_BASE_URL}/v3/place_order"
     start = time.perf_counter()
@@ -1003,13 +1037,13 @@ signal.signal(signal.SIGTERM, _handle_os_signal)
 
 
 def run() -> None:
-    if not API_KEY or not SECRET_KEY:
+    if EXCHANGE != "binance" and (not API_KEY or not SECRET_KEY):
         log.warning("API_KEY or SECRET_KEY missing. Orders will likely fail until set in .env.")
 
     throttle = ExecutionThrottle(EXECUTION_MIN_INTERVAL_SEC)
     log.info(
-        "Execution service starting | base=%s | min_interval=%.2fs",
-        ROOSTOO_BASE_URL,
+        "Execution service starting | exchange=%s | min_interval=%.2fs",
+        EXCHANGE,
         EXECUTION_MIN_INTERVAL_SEC,
     )
 

@@ -7,6 +7,8 @@ import os
 import tempfile
 import unittest
 
+os.environ["EXCHANGE"] = "roostoo"
+
 from tests.test_loader import load_module
 
 

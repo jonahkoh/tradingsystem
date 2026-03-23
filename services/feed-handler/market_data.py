@@ -1,10 +1,11 @@
 """
-Process A — Market Data (Roostoo)
-=================================
-Polls Roostoo REST ticker endpoint and publishes mid-price snapshots to Redis.
+Process A — Market Data
+=======================
+Polls exchange ticker endpoint and publishes mid-price snapshots to Redis.
 
-Input (Roostoo):
-  GET /v3/ticker?pair=BTC/USD&timestamp=<13-digit-ms>
+Supports two exchanges (selected by EXCHANGE env var):
+  - roostoo  (default): Roostoo mock API
+  - binance:            Binance Spot Testnet
 
 Output (Redis channel: market_data):
   {"symbol": "BTC/USD", "mid_price": 60500.50, "timestamp": 1709450000}
@@ -29,6 +30,7 @@ load_dotenv()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
+EXCHANGE = os.getenv("EXCHANGE", "roostoo").strip().lower()
 ROOSTOO_BASE_URL = os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com").rstrip("/")
 PAIR = os.getenv("TRADE_SYMBOL", "BTC/USD")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -102,22 +104,34 @@ def run() -> None:
     pair = _normalize_pair(PAIR)
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-    print(
-        f"[Market Data] Starting Roostoo poller | pair={pair} "
-        f"| base={ROOSTOO_BASE_URL} | poll={POLL_INTERVAL_SEC}s"
-    )
+    use_binance = EXCHANGE == "binance"
+
+    if use_binance:
+        from binance_adapter import fetch_ticker as _binance_fetch_ticker
+        print(
+            f"[Market Data] Starting Binance Testnet poller | pair={pair} "
+            f"| poll={POLL_INTERVAL_SEC}s"
+        )
+    else:
+        print(
+            f"[Market Data] Starting Roostoo poller | pair={pair} "
+            f"| base={ROOSTOO_BASE_URL} | poll={POLL_INTERVAL_SEC}s"
+        )
 
     with httpx.Client(timeout=REQUEST_TIMEOUT_SEC) as client:
         while True:
             cycle_start = time.time()
             try:
-                max_bid, min_ask, server_time_ms = _fetch_top_of_book(client, ROOSTOO_BASE_URL, pair)
+                if use_binance:
+                    max_bid, min_ask, server_time_ms = _binance_fetch_ticker(pair)
+                else:
+                    max_bid, min_ask, server_time_ms = _fetch_top_of_book(client, ROOSTOO_BASE_URL, pair)
+
                 mid_price = round((max_bid + min_ask) / 2.0, 6)
 
                 payload = {
                     "symbol": pair,
                     "mid_price": mid_price,
-                    # Keep integer seconds to preserve current strategy contract.
                     "timestamp": int(server_time_ms / 1000),
                 }
 

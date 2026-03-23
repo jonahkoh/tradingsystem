@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import unittest
+
+os.environ["EXCHANGE"] = "roostoo"
 
 from tests.test_loader import load_module
 

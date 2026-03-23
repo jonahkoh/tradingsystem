@@ -822,15 +822,14 @@ async def run() -> None:
             await redis_client.ping()
             log.info("Connected to Redis at %s:%s", REDIS_HOST, REDIS_PORT)
 
-            if not boot_liquidation_done:
-                await asyncio.sleep(8)
-                if await _load_state(redis_client):
-                    log.info("Resumed from persisted state — skipping startup liquidation.")
-                    boot_liquidation_done = True
-                else:
-                    await initialize_clean_slate(redis_client)
-                    boot_liquidation_done = True
-
+            # if not boot_liquidation_done:
+            #     await asyncio.sleep(8)
+            #     if await _load_state(redis_client):
+            #         log.info("Resumed from persisted state — skipping startup liquidation.")
+            #         boot_liquidation_done = True
+            #     else:
+            #         await initialize_clean_slate(redis_client)
+            #         boot_liquidation_done = True
 
             await consume_stream(redis_client)
 

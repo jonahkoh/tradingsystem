@@ -24,7 +24,8 @@ services:
     container_name: tradingsystem_feed_handler
     env_file: .env
     environment:
-      REDIS_HOST: redis       # override localhost → docker service name
+      REDIS_HOST: redis
+      EXCHANGE: ${EXCHANGE:-roostoo}
     depends_on:
       redis:
         condition: service_healthy
@@ -53,6 +54,7 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      EXCHANGE: ${EXCHANGE:-roostoo}
     depends_on:
       redis:
         condition: service_healthy

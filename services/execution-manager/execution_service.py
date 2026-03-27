@@ -193,6 +193,7 @@ def _build_order_result(
     quantity: str,
     requested_qty: float,
     effective_qty: float,
+    strategy_signal: str = "",
     response_json: Any = None,
     raw_error: str = "",
 ) -> dict[str, Any]:
@@ -213,6 +214,7 @@ def _build_order_result(
         "requested_qty": requested_qty,
         "effective_qty": effective_qty,
         "price": 0.0,
+        "strategy_signal": strategy_signal,
         "order_details": order_details,
         "raw_error": raw_error,
     }
@@ -754,6 +756,7 @@ def execute_trade_signal(
 ) -> dict[str, Any]:
     """Validate, sign, execute, and publish one trade signal."""
     side, pair, order_type, quantity = _validate_signal(signal_payload)
+    strategy_signal = str(signal_payload.get("reason") or "").strip() or "LIVE_SIGNAL"
     requested_qty = float(quantity) if quantity.upper() != "ALL" else -1.0
     effective_qty = requested_qty
 
@@ -796,6 +799,7 @@ def execute_trade_signal(
                 quantity=f"{effective_qty:.8f}",
                 requested_qty=requested_qty,
                 effective_qty=effective_qty,
+                strategy_signal=strategy_signal,
                 response_json=None,
                 raw_error=(
                     "sell skipped: insufficient available balance after clamp "
@@ -817,6 +821,7 @@ def execute_trade_signal(
             quantity=f"{effective_qty:.8f}",
             requested_qty=requested_qty,
             effective_qty=effective_qty,
+            strategy_signal=strategy_signal,
             response_json=None,
             raw_error=(
                 "order skipped: effective quantity below minimum tradable "
@@ -905,6 +910,7 @@ def execute_trade_signal(
         quantity=quantity,
         requested_qty=requested_qty,
         effective_qty=effective_qty,
+        strategy_signal=strategy_signal,
         response_json=response_json,
         raw_error=raw_error,
     )
@@ -981,6 +987,7 @@ def _handle_trade_message(
             "requested_qty": safe_qty,
             "effective_qty": safe_qty,
             "price": 0.0,
+            "strategy_signal": str(signal_payload.get("reason") or "").strip() or "LIVE_SIGNAL",
             "order_details": None,
             "raw_error": str(exc),
         }

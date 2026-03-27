@@ -58,7 +58,9 @@ DEFAULT_ORDER_TYPE = "MARKET"
 # ATR parameters
 ATR_PERIOD      = int(os.getenv("FET_ATR_PERIOD",      "14"))
 ATR_BREAKOUT_K  = float(os.getenv("FET_ATR_BREAKOUT_K", "2.0"))
+BREAKOUT_CONFIRM_TICKS = int(os.getenv("FET_BREAKOUT_CONFIRM_TICKS", "2"))
 ATR_STOPLOSS_K  = float(os.getenv("FET_ATR_STOPLOSS_K", "2.0"))
+FALLBACK_STOP_MULT = float(os.getenv("FET_FALLBACK_STOP_MULTIPLIER", "0.985"))
 # Minimum ATR floor — suppresses entries during flat warmup.
 # FET ~$0.5-2: 0.003 ≈ 0.3% move minimum before calling it a breakout.
 ATR_MIN_USD     = float(os.getenv("FET_ATR_MIN_USD",    "0.003"))
@@ -104,6 +106,7 @@ pending_action: str | None     = None
 pending_action_since: float    = 0.0
 pending_sell_quantity: str     = "0.0"
 cooldown_until: float          = 0.0
+breakout_streak: int           = 0
 
 boot_liquidation_done: bool    = False
 boot_liquidation_pending: bool = False
@@ -147,6 +150,16 @@ def _target_quantity(price: float) -> str:
     return f"{qty:.1f}"
 
 
+def _safe_nonneg_float(value: Any) -> float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(num):
+        return 0.0
+    return max(num, 0.0)
+
+
 # ── State Persistence ──────────────────────────────────────────────────────────
 async def _save_state(redis_client: aioredis.Redis) -> None:
     try:
@@ -172,9 +185,31 @@ async def _load_state(redis_client: aioredis.Redis) -> bool:
         return False
     in_position            = state.get("in_position", "False") == "True"
     open_position_quantity = state.get("open_position_quantity", "0.0")
-    entry_price            = float(state.get("entry_price",    "0.0"))
-    atr_at_entry           = float(state.get("atr_at_entry",  "0.0"))
-    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    entry_price            = _safe_nonneg_float(state.get("entry_price", "0.0"))
+    atr_at_entry           = _safe_nonneg_float(state.get("atr_at_entry", "0.0"))
+    cooldown_until         = _safe_nonneg_float(state.get("cooldown_until", "0.0"))
+
+    resumed_qty = _safe_nonneg_float(open_position_quantity)
+
+    # Defensive reset for inconsistent resumed state.
+    if in_position and (resumed_qty <= 0.0 or entry_price <= 0.0):
+        log.warning(
+            "Inconsistent resumed state detected; resetting flat state "
+            "(in_position=%s qty=%r entry=%.6f).",
+            in_position,
+            open_position_quantity,
+            entry_price,
+        )
+        in_position = False
+        open_position_quantity = "0.0"
+        entry_price = 0.0
+        atr_at_entry = 0.0
+
+    if not in_position:
+        open_position_quantity = "0.0"
+        entry_price = 0.0
+        atr_at_entry = 0.0
+
     log.info(
         "Resumed persisted state: in_position=%s qty=%s entry=%.6f atr_entry=%.6f",
         in_position, open_position_quantity, entry_price, atr_at_entry,
@@ -222,9 +257,9 @@ async def evaluate_market_tick(
 ) -> None:
     global last_price, pending_action, pending_action_since, in_position, open_position_quantity
     global entry_price, atr_at_entry, cooldown_until, pending_sell_quantity
-    global boot_liquidation_pending
+    global boot_liquidation_pending, breakout_streak
 
-    if symbol != TRADE_SYMBOL:
+    if symbol != TRADE_SYMBOL or price <= 0:
         return
 
     if last_price is None:
@@ -242,6 +277,7 @@ async def evaluate_market_tick(
             "ATR warm-up: %d/%d true ranges. px=%.6f",
             len(true_ranges), ATR_PERIOD, price,
         )
+        breakout_streak = 0
         return
 
     now_ts   = time.time()
@@ -260,6 +296,7 @@ async def evaluate_market_tick(
             "ATR too small (%.6f < min=%.6f) — waiting for real volatility.",
             current_atr, ATR_MIN_USD,
         )
+        breakout_streak = 0
         return
 
     if pending_action is not None:
@@ -271,30 +308,42 @@ async def evaluate_market_tick(
             pending_action = None
         else:
             log.info("Signal suppressed: awaiting %s fill confirmation.", pending_action)
+            breakout_streak = 0
             return
 
     if boot_liquidation_pending:
         log.info("Signal suppressed: awaiting startup liquidation confirmation.")
+        breakout_streak = 0
         return
 
     # ── Entry: Upside ATR Breakout + Sentiment Gate ──────────────────────────
+    breakout_hit = delta > ATR_BREAKOUT_K * current_atr
+    if not in_position and now_ts > cooldown_until and breakout_hit:
+        breakout_streak += 1
+    else:
+        breakout_streak = 0
+
     if (
         not in_position
         and now_ts > cooldown_until
-        and delta > ATR_BREAKOUT_K * current_atr
+        and breakout_streak >= BREAKOUT_CONFIRM_TICKS
         and sentiment_score > SENTIMENT_FEAR_GATE
     ):
         quantity             = _target_quantity(price)
+        if _safe_nonneg_float(quantity) <= 0.0:
+            log.info("Entry skipped: computed FET quantity is %s at px=%.6f", quantity, price)
+            return
         pending_action       = "BUY"
         pending_action_since = time.time()
         entry_price          = price
         atr_at_entry         = current_atr
+        breakout_streak      = 0
         await _publish_signal(
             redis_client,
             action="BUY",
             symbol=symbol,
             quantity=quantity,
-            reason=f"ATR_Breakout_{ATR_BREAKOUT_K}x_senti={sentiment_score:.3f}",
+            reason=f"ATR_Breakout_{ATR_BREAKOUT_K}x_confirm={BREAKOUT_CONFIRM_TICKS}_senti={sentiment_score:.3f}",
             timestamp=timestamp,
             expected_price=price,
         )
@@ -303,12 +352,20 @@ async def evaluate_market_tick(
     if not in_position:
         return
 
-    stop_loss_price   = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
+    if atr_at_entry > 0:
+        stop_loss_price = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
+    else:
+        # Persisted startup state can resume without ATR-at-entry.
+        stop_loss_price = entry_price * FALLBACK_STOP_MULT
     take_profit_price = entry_price * TAKE_PROFIT_MULT
 
     # ── Exit 1: ATR Stop-Loss ─────────────────────────────────────────────────
     if price <= stop_loss_price:
         sell_qty              = open_position_quantity
+        if _safe_nonneg_float(sell_qty) <= 0.0:
+            log.warning("Stop-loss skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
@@ -331,6 +388,10 @@ async def evaluate_market_tick(
     # ── Exit 2: Take-Profit ───────────────────────────────────────────────────
     if price >= take_profit_price:
         sell_qty              = open_position_quantity
+        if _safe_nonneg_float(sell_qty) <= 0.0:
+            log.warning("Take-profit skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
@@ -353,6 +414,10 @@ async def evaluate_market_tick(
     # ── Exit 3: Sentiment Reversal (bad news while profitable) ───────────────
     if price > entry_price and sentiment_score < SENTIMENT_EXIT_GATE:
         sell_qty              = open_position_quantity
+        if _safe_nonneg_float(sell_qty) <= 0.0:
+            log.warning("Sentiment exit skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty

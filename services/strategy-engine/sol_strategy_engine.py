@@ -13,7 +13,8 @@ and applies the optimal strategy for each:
                   BUY at lower band (SMA20 − 2σ), SELL at SMA20 (or above)
 
   TRENDING_UP   → ATR Breakout (momentum)
-                  BUY when one-tick delta > ATR_BREAKOUT_K × ATR
+                  BUY when breakout holds for SOL_BREAKOUT_CONFIRM_TICKS
+                  with delta > ATR_BREAKOUT_K × ATR
                   SELL at BREAKOUT_TP_MULT above entry
 
   TRENDING_DOWN → DCA Tranches (cost-averaging into the decline)
@@ -104,6 +105,7 @@ BB_PROFIT_MARGIN = float(os.getenv("SOL_BB_PROFIT_MARGIN", "0.005"))  # 0.5% min
 
 # ── TRENDING_UP: ATR Breakout + EMA death-cross exit ─────────────────────────
 ATR_BREAKOUT_K = float(os.getenv("SOL_ATR_BREAKOUT_K", "2.0"))
+BREAKOUT_CONFIRM_TICKS = int(os.getenv("SOL_BREAKOUT_CONFIRM_TICKS", "2"))
 EMA_FAST_PERIOD = int(os.getenv("SOL_EMA_FAST_PERIOD", "7"))    # fast EMA for cross exit
 EMA_SLOW_PERIOD = int(os.getenv("SOL_EMA_SLOW_PERIOD", "99"))   # slow EMA for cross exit
 
@@ -183,6 +185,7 @@ pending_sell_price: float       = 0.0   # price at time of SELL signal for retur
 
 # ── Breakout: previous tick price for delta ───────────────────────────────────
 prev_price: float | None = None
+breakout_streak: int = 0
 
 # ── EMA(7) / EMA(99) for death-cross exit ────────────────────────────────────
 ema_fast: float | None = None   # EMA(7)
@@ -412,6 +415,25 @@ async def _load_state(redis_client: aioredis.Redis) -> bool:
             average_cost = legacy
             log.warning("Migrated legacy entry_price=%.4f to average_cost.", average_cost)
 
+    try:
+        resumed_qty = float(open_position_quantity)
+    except (TypeError, ValueError):
+        resumed_qty = 0.0
+
+    if in_position and (resumed_qty <= 0.0 or average_cost <= 0.0):
+        log.warning(
+            "State mismatch corrected: in_position=True but qty=%.8f avg_cost=%.8f. Resetting to flat.",
+            resumed_qty,
+            average_cost,
+        )
+        in_position = False
+        open_position_quantity = "0.0000"
+        average_cost = 0.0
+        atr_at_entry = 0.0
+        tranche_count = 0
+        last_buy_price = 0.0
+        entry_regime = ""
+
     if not in_position:
         tranche_count  = 0
         last_buy_price = 0.0
@@ -467,7 +489,7 @@ async def evaluate_market_tick(
     global average_cost, tranche_count, last_buy_price, atr_at_entry, entry_regime
     global pending_action, pending_action_since, in_position, open_position_quantity
     global cooldown_until, pending_sell_quantity, pending_sell_price
-    global boot_liquidation_pending, prev_price
+    global boot_liquidation_pending, prev_price, breakout_streak
 
     if symbol != TRADE_SYMBOL or price <= 0:
         return
@@ -482,6 +504,7 @@ async def evaluate_market_tick(
     if len(sma50_prices) < WARMUP_TICKS:
         log.info("Warm-up: %d/%d ticks for SMA50.", len(sma50_prices), WARMUP_TICKS)
         prev_price = price
+        breakout_streak = 0
         return
 
     sma20 = sum(sma_prices) / len(sma_prices)
@@ -514,14 +537,17 @@ async def evaluate_market_tick(
             pending_action = None
         else:
             prev_price = price
+            breakout_streak = 0
             return
 
     if boot_liquidation_pending:
         prev_price = price
+        breakout_streak = 0
         return
 
     # ── EXITS (highest priority, regime-agnostic) ─────────────────────────────
     if in_position:
+        breakout_streak = 0
         # 1. ATR stop-loss with minimum floor to prevent stop-hunting in flat markets
         if atr_at_entry > 0:
             atr_stop   = average_cost - ATR_STOPLOSS_K * atr_at_entry
@@ -531,6 +557,18 @@ async def evaluate_market_tick(
             stop_price = average_cost * FALLBACK_STOP
         if price <= stop_price:
             sell_qty              = open_position_quantity
+            if float(sell_qty or 0.0) <= 0.0:
+                log.warning("ATR stop skipped: in_position=True but sell quantity is %r", sell_qty)
+                in_position = False
+                open_position_quantity = "0.0000"
+                average_cost = 0.0
+                atr_at_entry = 0.0
+                tranche_count = 0
+                last_buy_price = 0.0
+                entry_regime = ""
+                await _save_state(redis_client)
+                prev_price = price
+                return
             pending_action        = "SELL"
             pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
@@ -567,6 +605,18 @@ async def evaluate_market_tick(
 
         if tp_triggered:
             sell_qty              = open_position_quantity
+            if float(sell_qty or 0.0) <= 0.0:
+                log.warning("Exit skipped: in_position=True but sell quantity is %r", sell_qty)
+                in_position = False
+                open_position_quantity = "0.0000"
+                average_cost = 0.0
+                atr_at_entry = 0.0
+                tranche_count = 0
+                last_buy_price = 0.0
+                entry_regime = ""
+                await _save_state(redis_client)
+                prev_price = price
+                return
             pending_action        = "SELL"
             pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
@@ -614,6 +664,7 @@ async def evaluate_market_tick(
 
     # ── RANGING: Bollinger Band mean reversion ────────────────────────────────
     if current_regime == "RANGING":
+        breakout_streak = 0
         if price <= bb_lower:
             quantity = _sized_quantity(price, TARGET_ORDER_USD / 2)
             if int(quantity) > 0:
@@ -636,6 +687,11 @@ async def evaluate_market_tick(
         if prev_price is not None and atr_value > 0:
             delta = price - prev_price
             if delta > ATR_BREAKOUT_K * atr_value:
+                breakout_streak += 1
+            else:
+                breakout_streak = 0
+
+            if breakout_streak >= max(BREAKOUT_CONFIRM_TICKS, 1):
                 quantity = _sized_quantity(price, TARGET_ORDER_USD / 2)
                 if int(quantity) > 0:
                     pending_action       = "BUY"
@@ -649,11 +705,13 @@ async def evaluate_market_tick(
                         reason=f"ATR_Breakout_{ATR_BREAKOUT_K}x_delta={delta:.4f}_atr={atr_value:.6f}",
                         timestamp=timestamp, expected_price=price,
                     )
+                    breakout_streak = 0
                     prev_price = price
                     return
 
     # ── TRENDING_DOWN / UNCLEAR: DCA first tranche ────────────────────────────
     else:
+        breakout_streak = 0
         if price <= sma20 * (1.0 - INITIAL_DIP_PCT):
             unclear_adj = 0.5 if current_regime == "UNCLEAR" else 1.0
             alloc       = TARGET_ORDER_USD / MAX_TRANCHES

@@ -62,6 +62,7 @@ DEFAULT_ORDER_TYPE = "MARKET"
 ATR_PERIOD       = int(os.getenv("XRP_ATR_PERIOD",       "14"))
 ATR_BREAKOUT_K   = float(os.getenv("XRP_ATR_BREAKOUT_K", "2.0"))  # entry: spike > 2× ATR
 ATR_STOPLOSS_K   = float(os.getenv("XRP_ATR_STOPLOSS_K", "1.5"))  # exit: drop > 1.5× ATR from entry
+FALLBACK_STOP_MULT = float(os.getenv("XRP_FALLBACK_STOP_MULTIPLIER", "0.985"))
 # Minimum ATR in USD — prevents triggering on micro-noise when price is flat during warmup.
 # At XRP ~$1.40, 0.003 ≈ 0.2% move — a meaningful minimum before calling it a "breakout".
 ATR_MIN_USD      = float(os.getenv("XRP_ATR_MIN_USD",    "0.003"))
@@ -86,7 +87,7 @@ TARGET_ORDER_USD = PORTFOLIO_USD * XRP_ALLOCATION
 TRADING_FEE_RATE = float(os.getenv("TRADING_FEE_RATE",           "0.001"))
 POLL_TIMEOUT_SEC = float(os.getenv("STRATEGY_POLL_TIMEOUT_SEC",  "1.0"))
 RETRY_DELAY_SEC  = int(os.getenv("STRATEGY_RETRY_DELAY_SEC",     "5"))
-COOLDOWN_SECONDS = int(os.getenv("STOP_LOSS_COOLDOWN_SEC",        "3600"))
+COOLDOWN_SECONDS = int(os.getenv("XRP_STOP_LOSS_COOLDOWN_SEC", os.getenv("STOP_LOSS_COOLDOWN_SEC", "3600")))
 CONFIRMATION_TIMEOUT_SEC = float(os.getenv("CONFIRMATION_TIMEOUT_SEC", "60"))
 
 
@@ -379,6 +380,9 @@ async def evaluate_market_tick(
         and xrp_sentiment_score > SENTIMENT_FEAR_GATE     # not in fear — gate open
     ):
         quantity             = _target_quantity(price)
+        if int(quantity) <= 0:
+            log.info("Entry skipped: computed XRP quantity is 0 at px=%.6f target_usd=%.2f", price, TARGET_ORDER_USD)
+            return
         pending_action       = "BUY"
         pending_action_since = time.time()
         entry_price          = price
@@ -398,12 +402,20 @@ async def evaluate_market_tick(
     if not in_position:
         return
 
-    stop_loss_price  = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
+    if atr_at_entry > 0:
+        stop_loss_price = entry_price - (ATR_STOPLOSS_K * atr_at_entry)
+    else:
+        # State can be resumed without atr_at_entry (startup sync), so use a sane fallback stop.
+        stop_loss_price = entry_price * FALLBACK_STOP_MULT
     take_profit_price = entry_price * TAKE_PROFIT_MULT
 
     # ── Exit 1: ATR Stop-Loss ────────────────────────────────────────────────
     if price <= stop_loss_price:
         sell_qty              = open_position_quantity
+        if float(sell_qty or 0.0) <= 0.0:
+            log.warning("Stop-loss skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
@@ -426,6 +438,10 @@ async def evaluate_market_tick(
     # ── Exit 2: Take-Profit ──────────────────────────────────────────────────
     if price >= take_profit_price:
         sell_qty              = open_position_quantity
+        if float(sell_qty or 0.0) <= 0.0:
+            log.warning("Take-profit skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
@@ -450,6 +466,10 @@ async def evaluate_market_tick(
     # on a losing trade that is already heading for the ATR stop.
     if price > entry_price and xrp_sentiment_score < SENTIMENT_EXIT_GATE:
         sell_qty              = open_position_quantity
+        if float(sell_qty or 0.0) <= 0.0:
+            log.warning("Sentiment exit skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty

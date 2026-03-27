@@ -231,6 +231,16 @@ def _quantity_from_notional(price: float, notional: float) -> str:
     return f"{qty:.4f}"
 
 
+def _safe_nonneg_float(value: Any) -> float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(num):
+        return 0.0
+    return max(num, 0.0)
+
+
 def compute_bollinger_inputs(latest_prices: list[float]) -> tuple[float, float]:
     sma = _mean(latest_prices)
     std = _std(latest_prices, sma)
@@ -273,15 +283,19 @@ async def evaluate_market_tick(
     redis_client: aioredis.Redis,
 ) -> None:
     global pending_action, in_position, open_position_quantity, entry_price
+    global pending_action_since
     global stop_loss_price, cooldown_until, pending_sell_quantity
     global boot_liquidation_pending, half_position_sold
 
     # Guard: only process ticks for this strategy's configured symbol.
-    if symbol != DEFAULT_SYMBOL:
+    if symbol != DEFAULT_SYMBOL or price <= 0:
         return
 
     # ── 1. ATR update (uses previous price, must run before appending) ───────
     current_atr = _compute_atr(price)
+
+    # Keep trend window in sync from the first tick so TREND_FILTER_PERIOD is accurate.
+    trend_prices.append(price)
 
     # ── 2. Bollinger window ──────────────────────────────────────────────────
     prices.append(price)
@@ -290,7 +304,6 @@ async def evaluate_market_tick(
         return
 
     # ── 3. Trend filter window ───────────────────────────────────────────────
-    trend_prices.append(price)
     trend_sma: float | None = (
         _mean(list(trend_prices)) if len(trend_prices) >= TREND_FILTER_PERIOD else None
     )
@@ -350,6 +363,10 @@ async def evaluate_market_tick(
             )
             return
 
+        if _safe_nonneg_float(quantity) <= 0.0:
+            log.info("BUY skipped: computed quantity is %s at px=%.6f notional=%.2f", quantity, price, dyn_notional)
+            return
+
         pending_action       = "BUY"
         pending_action_since = time.time()
         entry_price          = price
@@ -386,6 +403,15 @@ async def evaluate_market_tick(
     # ── 10. Stop-Loss (ATR-based) ────────────────────────────────────────────
     if price <= stop_loss_price:
         sell_qty              = open_position_quantity
+        if _safe_nonneg_float(sell_qty) <= 0.0:
+            log.warning("ATR stop skipped: in_position=True but sell quantity is %r", sell_qty)
+            in_position = False
+            open_position_quantity = "0.0000"
+            entry_price = 0.0
+            stop_loss_price = 0.0
+            half_position_sold = False
+            await _save_state(redis_client)
+            return
         pending_action        = "SELL"
         pending_action_since  = time.time()
         pending_sell_quantity = sell_qty
@@ -411,7 +437,7 @@ async def evaluate_market_tick(
     if PARTIAL_EXITS_ENABLED:
         # First partial exit: sell 50% when price >= SMA and fee spread met.
         if not half_position_sold and price >= sma and price >= minimum_sell_price:
-            total_qty = float(open_position_quantity)
+            total_qty = _safe_nonneg_float(open_position_quantity)
             half_qty  = math.floor(total_qty / 2 * 10_000) / 10_000
 
             if half_qty > 0:
@@ -437,6 +463,15 @@ async def evaluate_market_tick(
         # Second partial exit: sell remaining 50% when price reaches upper band.
         if half_position_sold and price >= upper_band:
             sell_qty              = open_position_quantity
+            if _safe_nonneg_float(sell_qty) <= 0.0:
+                log.warning("Upper-band exit skipped: in_position=True but sell quantity is %r", sell_qty)
+                in_position = False
+                open_position_quantity = "0.0000"
+                entry_price = 0.0
+                stop_loss_price = 0.0
+                half_position_sold = False
+                await _save_state(redis_client)
+                return
             pending_action        = "SELL"
             pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
@@ -455,6 +490,15 @@ async def evaluate_market_tick(
         # Original single-exit: sell all at SMA once fee spread met.
         if price >= sma and price >= minimum_sell_price:
             sell_qty              = open_position_quantity
+            if _safe_nonneg_float(sell_qty) <= 0.0:
+                log.warning("Mean-reversion TP skipped: in_position=True but sell quantity is %r", sell_qty)
+                in_position = False
+                open_position_quantity = "0.0000"
+                entry_price = 0.0
+                stop_loss_price = 0.0
+                half_position_sold = False
+                await _save_state(redis_client)
+                return
             pending_action        = "SELL"
             pending_action_since  = time.time()
             pending_sell_quantity = sell_qty
@@ -502,10 +546,32 @@ async def _load_state(redis_client: aioredis.Redis) -> bool:
         return False
     in_position            = state.get("in_position", "False") == "True"
     open_position_quantity = state.get("open_position_quantity", "0.0000")
-    entry_price            = float(state.get("entry_price",     "0.0"))
-    stop_loss_price        = float(state.get("stop_loss_price", "0.0"))
+    entry_price            = _safe_nonneg_float(state.get("entry_price", "0.0"))
+    stop_loss_price        = _safe_nonneg_float(state.get("stop_loss_price", "0.0"))
     half_position_sold     = state.get("half_position_sold", "False") == "True"
-    cooldown_until         = float(state.get("cooldown_until", "0.0"))
+    cooldown_until         = _safe_nonneg_float(state.get("cooldown_until", "0.0"))
+
+    resumed_qty = _safe_nonneg_float(open_position_quantity)
+    if in_position and (resumed_qty <= 0.0 or entry_price <= 0.0):
+        log.warning(
+            "Inconsistent resumed state detected; resetting flat state "
+            "(in_position=%s qty=%r entry=%.6f).",
+            in_position,
+            open_position_quantity,
+            entry_price,
+        )
+        in_position = False
+        open_position_quantity = "0.0000"
+        entry_price = 0.0
+        stop_loss_price = 0.0
+        half_position_sold = False
+
+    if not in_position:
+        open_position_quantity = "0.0000"
+        entry_price = 0.0
+        stop_loss_price = 0.0
+        half_position_sold = False
+
     log.info(
         "Resumed persisted state: in_position=%s qty=%s entry=%.4f stop=%.4f half_sold=%s",
         in_position, open_position_quantity, entry_price, stop_loss_price, half_position_sold,

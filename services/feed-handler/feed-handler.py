@@ -30,12 +30,7 @@ SYMBOL      = os.getenv("TRADE_SYMBOL", "BTCUSDT").lower()   # ws stream is lowe
 CHANNEL     = "market_data"
 
 # Binance WebSocket endpoint
-# FEED_TESTNET=false (default) → real production stream, real prices, no auth needed
-# FEED_TESTNET=true            → testnet stream, simulated prices
-# NOTE: this is independent of order execution — orders always go to Binance Testnet REST.
-FEED_TESTNET     = os.getenv("FEED_TESTNET", "false").lower() == "true"
-WS_HOST          = "stream.testnet.binance.vision" if FEED_TESTNET else "stream.binance.com:9443"
-WS_URL           = f"wss://{WS_HOST}/ws/{SYMBOL}@bookTicker"
+WS_URL      = f"wss://stream.testnet.binance.vision/ws/{SYMBOL}@bookTicker"     # Individual Symbol Book Ticker Streams on Binance
 
 # Throttle: publish at most once every PUBLISH_INTERVAL seconds.
 # bookTicker fires 20-30x/s on production; 1 s is plenty for MA-based strategies.
